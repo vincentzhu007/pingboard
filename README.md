@@ -8,9 +8,15 @@ It is a static page that talks to the GitHub or GitCode API from your browser: n
 
 ## GitCode
 
-Choose **GitCode** on the sign-in screen and enter a GitCode personal access token. No GitCode repository is preselected. The first time you add PRs or start monitoring, enter `owner/repo`; change it later in **Settings → Default repository**. Pin PRs using `42`, `owner/repo#42`, or `https://gitcode.com/owner/repo/pull/42` (also accepts `/pulls/` and `/merge_requests/`). Sign out to choose another platform.
+Choose **GitCode** on the sign-in screen and enter a GitCode personal access token. No GitCode repository is preselected. The first time you add PRs, enter `owner/repo`; change it later in **Settings → Default repository**. Monitoring has its own repository list. Pin PRs using `42`, `owner/repo#42`, or `https://gitcode.com/owner/repo/pull/42` (also accepts `/pulls/` and `/merge_requests/`). Sign out to choose another platform.
 
-For maintainer monitoring, click **Monitor repository** after signing in. All currently open PRs are pinned in a repository group, and each refresh discovers new PRs automatically. Closed and merged PRs remain visible until you clear them. Unpinning a PR excludes it from future discovery; manually pin it again to resume tracking. **Stop monitoring** stops discovery without removing pins. Monitoring resumes after reload and runs only while this page is open (background tabs refresh more slowly); it is not a server-side monitor. Scans are paginated, and failures appear in the top bar without applying a partial list. The watched repository stays fixed even if you change the default; stop and restart monitoring to watch the new default.
+For maintainer monitoring, click **Add Repo** after signing in. Add any number of `owner/repo` entries; each repository discovers open PRs into its own board and reports its scan status independently. Up to four repository scans run concurrently; additional repositories wait for the next scheduler tick. One failed scan does not block the others, and incomplete lists are never applied. Use **Stop** next to a repository to stop discovery while keeping its pinned PRs refreshing.
+
+Closed and merged PRs remain visible until you clear them. Unpinning a PR excludes only that repository's PR from future discovery; manually pin it again to resume tracking. The monitored repository list is independent of the default repository, survives reloads, and is included in backups. Existing single-repository monitoring settings migrate automatically. Monitoring runs only while this page is open (background tabs refresh more slowly); it is not a server-side monitor.
+
+Use the **Repository board** selector in the top bar only to switch existing repositories. Add repositories using **Add Repo** on the right. Each board shows only its own PRs and groups. Groups with the same name in different repositories are independent; filters, search text and selection are remembered per board during the session. The active repository survives reloads, while all monitored repositories continue refreshing in the background.
+
+**+ Add PRs** and a group's **+ Add** browse the current repository. Click a PR to pin or unpin it; bare numbers also refer to the current board. To add a PR from another repository, switch boards first. Pinning or unpinning `#42` in one repository never changes `#42` in another. Existing mixed-repository groups are split automatically, preserving their names and pins. Backups include all repository boards.
 
 GitCode support includes:
 

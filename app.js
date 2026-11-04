@@ -151,7 +151,7 @@ function pinKey(repo, number) {
 }
 
 function shortRef(repo, number) {
-  return repo === state.prefs.defaultRepo ? `#${number}` : `${repo}#${number}`;
+  return repo === (IS_GITCODE ? state.prefs.activeRepo : state.prefs.defaultRepo) ? `#${number}` : `${repo}#${number}`;
 }
 
 /* URLs from the API end up in href / window.open; only ever follow web links. */
@@ -165,7 +165,7 @@ function openUrl(url) {
 
 /* "123", "#123", "owner/repo#123" or a PR URL; several may be pasted at once.
    Returns null when the input is not purely PR references (i.e. it is a search). */
-function parseRefs(raw) {
+function parseRefs(raw, defaultRepo = state.prefs.defaultRepo) {
   const refs = [];
   for (const token of raw.trim().split(/[\s,]+/).filter(Boolean)) {
     let match;
@@ -178,7 +178,7 @@ function parseRefs(raw) {
       refs.push({ repo: match[1], number: Number(match[2]) });
     }
     else if ((match = token.match(/^([\w.-]+\/[\w.-]+)#(\d+)$/))) refs.push({ repo: match[1], number: Number(match[2]) });
-    else if (state.prefs.defaultRepo && (match = token.match(/^#?(\d+)$/))) refs.push({ repo: state.prefs.defaultRepo, number: Number(match[1]) });
+    else if (defaultRepo && (match = token.match(/^#?(\d+)$/))) refs.push({ repo: defaultRepo, number: Number(match[1]) });
     else return null;
   }
   return refs.length ? refs : null;
@@ -226,7 +226,8 @@ function normalizePrefs(raw) {
     defaultRepo: /^[\w.-]+\/[\w.-]+$/.test(prefs.defaultRepo || "") ? prefs.defaultRepo : DEFAULT_REPO,
     following: parseLogins(Array.isArray(prefs.following) ? prefs.following.join(" ") : ""),
     ...(IS_GITCODE ? {
-      monitoredRepo: /^[\w.-]+\/[\w.-]+$/.test(prefs.monitoredRepo || "") ? prefs.monitoredRepo : null,
+      activeRepo: /^[\w.-]+\/[\w.-]+$/.test(prefs.activeRepo || "") ? prefs.activeRepo : "",
+      monitoredRepos: [...new Set((Array.isArray(prefs.monitoredRepos) ? prefs.monitoredRepos : [prefs.monitoredRepo]).filter((repo) => typeof repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(repo)))],
       ignoredPRs: Array.isArray(prefs.ignoredPRs) ? [...new Set(prefs.ignoredPRs.filter((key) => typeof key === "string" && /^[\w.-]+\/[\w.-]+#\d+$/.test(key)))] : []
     } : {}),
     repoProfiles: normalizeRepoProfiles(prefs.repoProfiles)
@@ -237,7 +238,11 @@ function loadUserState() {
   state.prefs = normalizePrefs(store.get(scopedKey("prefs"), {}));
 
   state.board = cleanBoard(store.get(scopedKey("board"), null)) || { groups: [{ id: "g1", name: "Tracking", collapsed: false }], pins: [] };
-  state.cursor = state.board.pins[0]?.key || null;
+  if (IS_GITCODE) {
+    state.prefs.activeRepo ||= state.prefs.defaultRepo || state.prefs.monitoredRepos[0] || state.board.pins[0]?.repo || "";
+    ensureRepoBoard(state.prefs.activeRepo);
+  }
+  state.cursor = boardPins()[0]?.key || null;
 }
 
 /* Normalise a board read from storage or a backup file; null if it is not one. */
@@ -245,7 +250,7 @@ function cleanBoard(raw) {
   if (!Array.isArray(raw?.groups) || !Array.isArray(raw.pins)) return null;
   const groups = raw.groups
     .filter((group) => group && typeof group.id === "string" && typeof group.name === "string" && group.name.trim())
-    .map((group) => ({ id: group.id, name: group.name.trim(), collapsed: Boolean(group.collapsed) }));
+    .map((group) => ({ id: group.id, name: group.name.trim(), collapsed: Boolean(group.collapsed), ...(IS_GITCODE && typeof group.repo === "string" ? { repo: group.repo } : {}) }));
   if (!groups.length) return null;
   const seen = new Set();
   const pins = [];
@@ -262,6 +267,21 @@ function cleanBoard(raw) {
       addedAt: Number(pin.addedAt) || Date.now(),
       ...(typeof pin.seen === "string" ? { seen: pin.seen } : {})
     });
+  }
+  if (IS_GITCODE) {
+    // Split legacy mixed-repository groups without losing their names, order or pins.
+    const scoped = [];
+    for (const group of groups) {
+      const members = pins.filter((pin) => pin.group === group.id);
+      const repos = [...new Set([group.repo, ...members.map((pin) => pin.repo)].filter(Boolean))];
+      if (!repos.length) repos.push(state.prefs.activeRepo || state.prefs.defaultRepo || "");
+      for (const [index, repo] of repos.entries()) {
+        const id = index === 0 ? group.id : `${group.id}:${repo}`;
+        scoped.push({ ...group, id, repo });
+        for (const pin of members) if (pin.repo === repo) pin.group = id;
+      }
+    }
+    return { groups: scoped, pins };
   }
   return { groups, pins };
 }
@@ -321,6 +341,15 @@ async function importBoard(file) {
   const applyPrefs = () => {
     if (!prefs) return;
     state.prefs = prefs;
+    if (IS_GITCODE) {
+      state.prefs.activeRepo ||= state.prefs.defaultRepo || state.board.pins[0]?.repo || "";
+      ensureRepoBoard(state.prefs.activeRepo);
+      state.cursor = boardPins()[0]?.key || null;
+      state.query = "";
+      state.filter = "all";
+      repositoryViews.clear();
+      shellMode = null;
+    }
     persistPrefs();
     applyBoardWidth();
   };
@@ -332,7 +361,7 @@ async function importBoard(file) {
         key: "Enter",
         label: "Add to my board",
         run: () => {
-          const groupIds = new Map(board.groups.map((group) => [group.id, ensureGroup(group.name).id]));
+          const groupIds = new Map(board.groups.map((group) => [group.id, ensureGroup(group.name, group.repo).id]));
           const added = board.pins.filter((pin) => addPin(pin.repo, pin.number, groupIds.get(pin.group))).length;
           applyPrefs();
           toast(`Added ${added} of ${count}`, "ok");
@@ -503,7 +532,7 @@ async function listGitCodePRs(repo, filters = {}, isCurrent = () => true) {
   throw new Error("PR list exceeded 100 pages; narrow the repository filter");
 }
 
-let repoMonitor = { at: 0, loading: false, error: "" };
+const repoMonitors = new Map();
 
 function chooseDefaultRepo(then) {
   openPrompt({
@@ -511,6 +540,7 @@ function chooseDefaultRepo(then) {
     onSubmit(value) {
       if (!/^[\w.-]+\/[\w.-]+$/.test(value)) return "Repository must look like owner/repo";
       state.prefs.defaultRepo = value;
+      if (IS_GITCODE) switchRepository(value);
       persistPrefs();
       // The prompt closes after onSubmit returns; open the next view afterwards.
       setTimeout(then, 0);
@@ -518,22 +548,75 @@ function chooseDefaultRepo(then) {
   });
 }
 
-function toggleRepoMonitor() {
-  if (!state.prefs.monitoredRepo && !state.prefs.defaultRepo) return chooseDefaultRepo(toggleRepoMonitor);
-  state.prefs.monitoredRepo = state.prefs.monitoredRepo ? null : state.prefs.defaultRepo;
-  repoMonitor = { at: 0, loading: false, error: "" };
+function addRepoMonitor(repo) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return "Repository must look like owner/repo";
+  if (state.prefs.monitoredRepos.includes(repo)) return "This repository is already monitored";
+  state.prefs.monitoredRepos.push(repo);
+  ensureRepoBoard(repo);
+  if (!state.prefs.activeRepo) switchRepository(repo);
   persistPrefs();
   tick();
+  return null;
 }
 
-async function refreshRepoMonitor(force = false) {
-  const repo = state.prefs.monitoredRepo;
-  if (!IS_GITCODE || !repo || !state.user || repoMonitor.loading) return;
+function stopRepoMonitor(repo) {
+  state.prefs.monitoredRepos = state.prefs.monitoredRepos.filter((item) => item !== repo);
+  repoMonitors.delete(repo); // Invalidates any scan still in flight.
+  persistPrefs();
+  render();
+}
+
+function openRepoMonitors() {
+  const list = el("div");
+  const error = el("p", { class: "t-bad small" });
+  const input = el("input", { type: "text", placeholder: "owner/repo", "aria-label": "Repository to monitor", value: state.prefs.defaultRepo, spellcheck: "false" });
+  const add = () => {
+    error.textContent = addRepoMonitor(input.value.trim()) || "";
+    if (!error.textContent) input.value = "";
+    modal.update();
+  };
+  input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); add(); } });
+  const modal = { update() {
+    list.replaceChildren(...state.prefs.monitoredRepos.map((repo) => {
+      const scan = repoMonitors.get(repo);
+      const status = scan?.error || (scan?.loading ? "Scanning…" : scan?.at ? `Scanned ${ago(scan.at)} ago` : "Waiting to scan");
+      return el("div", { class: "panel" }, [
+        el("div", { class: "split" }, [el("strong", { text: repo }), el("button", { class: "btn", text: "Stop", "aria-label": `Stop monitoring ${repo}`, onclick: () => { stopRepoMonitor(repo); modal.update(); } })]),
+        el("p", { class: scan?.error ? "t-bad small" : "muted small", text: status })
+      ]);
+    }));
+    if (!state.prefs.monitoredRepos.length) list.append(el("p", { class: "muted", text: "No repositories monitored yet." }));
+  } };
+  mountModal(modal, el("div", { class: "modal small" }, [
+    el("h2", { text: "Monitored repositories" }),
+    el("p", { class: "muted small", text: "Discover new PRs in each repository automatically. Stopping discovery keeps existing pins refreshing." }),
+    list, el("label", { class: "field" }, ["Repository to monitor", input]), error,
+    el("div", { class: "choices" }, [el("button", { class: "btn primary", text: "Add repository", onclick: add }), el("button", { class: "btn", text: "Done", onclick: closeModal })])
+  ]));
+  modal.update();
+}
+
+async function refreshRepoMonitors(force = false) {
+  if (!IS_GITCODE || !state.user) return;
+  const repos = state.prefs.monitoredRepos;
+  for (const repo of repoMonitors.keys()) if (!repos.includes(repo)) repoMonitors.delete(repo);
+  const jobs = [];
+  for (const repo of repos) {
+    if ([...repoMonitors.values()].filter((scan) => scan.loading).length >= REFRESH_CONCURRENCY) break;
+    jobs.push(refreshRepoMonitor(repo, force));
+  }
+  await Promise.all(jobs);
+}
+
+async function refreshRepoMonitor(repo, force = false) {
+  if (!IS_GITCODE || !state.user || !state.prefs.monitoredRepos.includes(repo)) return;
+  if (!repoMonitors.has(repo)) repoMonitors.set(repo, { at: 0, loading: false, error: "" });
+  const scan = repoMonitors.get(repo);
+  if (scan.loading) return;
   const interval = state.prefs.interval * 1000 * (document.hidden ? HIDDEN_SLOWDOWN : 1);
-  if (!force && Date.now() - repoMonitor.at < interval) return;
-  const scan = repoMonitor;
+  if (!force && Date.now() - scan.at < interval) return;
   const user = state.user;
-  const isCurrent = () => state.user === user && state.prefs.monitoredRepo === repo && repoMonitor === scan;
+  const isCurrent = () => state.user === user && state.prefs.monitoredRepos.includes(repo) && repoMonitors.get(repo) === scan;
   scan.loading = true;
   render();
   try {
@@ -542,7 +625,7 @@ async function refreshRepoMonitor(force = false) {
     const ignored = new Set(state.prefs.ignoredPRs);
     const fresh = prs.filter((pr) => !pinByKey(pinKey(repo, pr.number)) && !ignored.has(pinKey(repo, pr.number)));
     if (fresh.length) {
-      const group = ensureGroup(repo);
+      const group = boardGroups(repo)[0] || ensureGroup("Tracking", repo);
       for (const pr of fresh) addPin(repo, pr.number, group.id);
       toast(`Added ${fresh.length} open PR${fresh.length === 1 ? "" : "s"} from ${repo}`);
     }
@@ -1020,13 +1103,13 @@ function tick() {
       if (!status?.at || now - status.at >= ttl) queueRefresh(pin);
     }
     refreshBaselines();
-    refreshRepoMonitor();
+    refreshRepoMonitors();
   }
   render();
 }
 
 function refreshAll() {
-  refreshRepoMonitor(true);
+  refreshRepoMonitors(true);
   for (const pin of state.board.pins) queueRefresh(pin, { force: true });
   state.baselines.clear();
 }
@@ -1056,8 +1139,46 @@ function cursorPR() {
   return state.data.get(state.cursor);
 }
 
+const repositoryViews = new Map();
+
+function boardGroups(repo = state.prefs.activeRepo) {
+  return IS_GITCODE ? state.board.groups.filter((group) => (group.repo || "") === (repo || "")) : state.board.groups;
+}
+
+function boardPins() {
+  return IS_GITCODE ? state.board.pins.filter((pin) => pin.repo === state.prefs.activeRepo) : state.board.pins;
+}
+
+function repositoryNames() {
+  return [...new Set([state.prefs.activeRepo, state.prefs.defaultRepo, ...(state.prefs.monitoredRepos || []),
+    ...state.board.groups.map((group) => group.repo), ...state.board.pins.map((pin) => pin.repo)].filter(Boolean))].sort();
+}
+
+function ensureRepoBoard(repo) {
+  if (!IS_GITCODE || boardGroups(repo).length) return;
+  const blank = state.board.groups.find((group) => !group.repo && !state.board.pins.some((pin) => pin.group === group.id));
+  if (blank) { blank.repo = repo; persistBoard(); }
+  else ensureGroup("Tracking", repo);
+}
+
+function switchRepository(repo) {
+  if (!IS_GITCODE || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return;
+  repositoryViews.set(state.prefs.activeRepo, { cursor: state.cursor, filter: state.filter, query: state.query });
+  state.prefs.activeRepo = repo;
+  ensureRepoBoard(repo);
+  const saved = repositoryViews.get(repo);
+  state.cursor = saved?.cursor && pinByKey(saved.cursor)?.repo === repo ? saved.cursor : boardPins()[0]?.key || null;
+  state.filter = saved?.filter || "all";
+  state.query = saved?.query || "";
+  closeModal();
+  persistPrefs();
+  const input = document.querySelector("#filter");
+  if (input) input.value = state.query;
+  render();
+}
+
 function targetGroupId() {
-  return cursorPin()?.group || state.board.groups[0].id;
+  return cursorPin()?.group || boardGroups()[0]?.id;
 }
 
 function addPin(repo, number, group = targetGroupId()) {
@@ -1067,6 +1188,10 @@ function addPin(repo, number, group = targetGroupId()) {
     state.prefs.ignoredPRs = state.prefs.ignoredPRs.filter((item) => item !== key);
     persistPrefs();
   }
+  if (IS_GITCODE && state.board.groups.find((item) => item.id === group)?.repo !== repo) {
+    ensureRepoBoard(repo);
+    group = boardGroups(repo)[0].id;
+  }
   const pin = { key, repo, number, group, addedAt: Date.now() };
   state.board.pins.push(pin);
   // Ask the browser not to evict this site's storage under disk pressure.
@@ -1075,14 +1200,14 @@ function addPin(repo, number, group = targetGroupId()) {
   if (target) target.collapsed = false;
   persistBoard();
   queueRefresh(pin);
-  if (!state.cursor) state.cursor = key;
+  if (!state.cursor && (!IS_GITCODE || repo === state.prefs.activeRepo)) state.cursor = key;
   return true;
 }
 
 function removePin(key) {
   const pin = pinByKey(key);
   if (!pin) return;
-  if (IS_GITCODE && state.prefs.monitoredRepo === pin.repo) {
+  if (IS_GITCODE && state.prefs.monitoredRepos.includes(pin.repo)) {
     state.prefs.ignoredPRs = [...new Set([...state.prefs.ignoredPRs, key])];
     persistPrefs();
   }
@@ -1098,7 +1223,7 @@ function removePin(key) {
     label: "Undo",
     run: () => {
       if (pinByKey(key)) return;
-      if (!state.board.groups.some((group) => group.id === pin.group)) pin.group = state.board.groups[0].id;
+      if (!state.board.groups.some((group) => group.id === pin.group)) pin.group = IS_GITCODE ? (boardGroups(pin.repo)[0] || ensureGroup("Tracking", pin.repo)).id : state.board.groups[0].id;
       if (IS_GITCODE) {
         state.prefs.ignoredPRs = state.prefs.ignoredPRs.filter((item) => item !== key);
         persistPrefs();
@@ -1112,7 +1237,7 @@ function removePin(key) {
 }
 
 function clearClosed() {
-  const closed = state.board.pins.filter((pin) => {
+  const closed = boardPins().filter((pin) => {
     const pr = state.data.get(pin.key);
     return pr && pr.state !== "OPEN";
   });
@@ -1125,16 +1250,17 @@ function clearClosed() {
   toast(closed.length ? `Cleared ${closed.length} merged/closed` : "Nothing merged or closed to clear");
 }
 
-function ensureGroup(name) {
-  const existing = state.board.groups.find((group) => group.name.toLowerCase() === name.toLowerCase());
+function ensureGroup(name, repo = state.prefs.activeRepo) {
+  const existing = boardGroups(repo).find((group) => group.name.toLowerCase() === name.toLowerCase());
   if (existing) return existing;
-  const group = { id: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name, collapsed: false };
+  const group = { id: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, name, collapsed: false, ...(IS_GITCODE ? { repo: repo || "" } : {}) };
   state.board.groups.push(group);
   persistBoard();
   return group;
 }
 
 function movePinToGroup(pin, group) {
+  if (IS_GITCODE && group.repo !== pin.repo) return;
   pin.group = group.id;
   group.collapsed = false;
   // Re-append so it lands at the end of its new group.
@@ -1149,7 +1275,7 @@ function newGroup() {
     placeholder: "Group name",
     submit: "Create",
     onSubmit(name) {
-      if (state.board.groups.some((group) => group.name.toLowerCase() === name.toLowerCase())) return `There is already a group called "${name}".`;
+      if (boardGroups().some((group) => group.name.toLowerCase() === name.toLowerCase())) return `There is already a group called "${name}".`;
       ensureGroup(name);
       return null;
     }
@@ -1159,7 +1285,7 @@ function newGroup() {
 /* Drag-and-drop target: place a pin in a group, before another pin or at the end. */
 function dropPin(key, groupId, beforeKey = null) {
   const pin = pinByKey(key);
-  if (!pin || key === beforeKey) return;
+  if (!pin || key === beforeKey || (IS_GITCODE && state.board.groups.find((group) => group.id === groupId)?.repo !== pin.repo)) return;
   const pins = state.board.pins.filter((item) => item !== pin);
   pin.group = groupId;
   const at = beforeKey ? pins.findIndex((item) => item.key === beforeKey) : -1;
@@ -1175,7 +1301,7 @@ function renameGroup(group) {
     value: group.name,
     submit: "Rename",
     onSubmit(name) {
-      if (state.board.groups.some((other) => other !== group && other.name.toLowerCase() === name.toLowerCase())) return `There is already a group called "${name}".`;
+      if (boardGroups().some((other) => other !== group && other.name.toLowerCase() === name.toLowerCase())) return `There is already a group called "${name}".`;
       group.name = name;
       persistBoard();
       return null;
@@ -1184,8 +1310,8 @@ function renameGroup(group) {
 }
 
 function deleteGroup(group) {
-  if (state.board.groups.length === 1) return toast("The board needs at least one group");
-  const fallback = state.board.groups.find((item) => item !== group);
+  if (boardGroups().length === 1) return toast("The board needs at least one group");
+  const fallback = boardGroups().find((item) => item !== group);
   const count = state.board.pins.filter((pin) => pin.group === group.id).length;
   const remove = () => {
     for (const pin of state.board.pins) if (pin.group === group.id) pin.group = fallback.id;
@@ -1237,7 +1363,7 @@ const FILTERS = IS_GITCODE ? [
 /* The selected PR stays listed even if a refresh moves it out of the filter, so
    actions never silently retarget to another row. */
 function matchesView(pin) {
-  return pin.key === state.cursor || matchesFilter(pin);
+  return (!IS_GITCODE || pin.repo === state.prefs.activeRepo) && (pin.key === state.cursor || matchesFilter(pin));
 }
 
 function setFilter(id) {
@@ -1253,6 +1379,7 @@ function reselect() {
 }
 
 function matchesFilter(pin) {
+  if (IS_GITCODE && pin.repo !== state.prefs.activeRepo) return false;
   const pr = state.data.get(pin.key);
   const filter = FILTERS.find((item) => item.id === state.filter) || FILTERS[0];
   if (!filter.test(pr)) return false;
@@ -1267,7 +1394,7 @@ function groupPins(group) {
 }
 
 function visiblePins() {
-  return state.board.groups.flatMap((group) => (group.collapsed ? [] : groupPins(group)));
+  return boardGroups().flatMap((group) => (group.collapsed ? [] : groupPins(group)));
 }
 
 function acknowledge(key) {
@@ -1279,6 +1406,7 @@ function acknowledge(key) {
 }
 
 function setCursor(key) {
+  if (IS_GITCODE && key && pinByKey(key)?.repo !== state.prefs.activeRepo) return;
   if (key !== state.cursor) acknowledge(state.cursor);
   state.cursor = key;
   acknowledge(key);
@@ -1569,12 +1697,16 @@ function buildShell() {
   return el("div", { class: "shell" }, [
     el("header", { class: "top" }, [
       el("div", { class: "brand" }, [el("span", { class: "brand-dot" }), "Pingboard"]),
+      IS_GITCODE ? el("select", { id: "board-repo", "aria-label": "Repository board", onchange: (event) => {
+        switchRepository(event.target.value);
+      } }) : null,
       el("div", { class: "chips", id: "chips" }),
       el("input", {
         id: "filter",
         class: "filter",
         type: "search",
         placeholder: "Filter pinned PRs",
+        value: state.query,
         spellcheck: "false",
         autocomplete: "off",
         "aria-label": "Filter pinned pull requests",
@@ -1595,7 +1727,7 @@ function buildShell() {
       }),
       el("div", { class: "top-right" }, [
         el("span", { class: "sync", id: "sync" }),
-        IS_GITCODE ? el("button", { class: "btn", id: "monitor-repo", onclick: toggleRepoMonitor }) : null,
+        IS_GITCODE ? el("button", { class: "btn", id: "monitor-repo", onclick: openRepoMonitors }) : null,
         el("button", { class: "btn primary", onclick: () => openAdd(), text: "+ Add PRs" }),
         el("button", { class: "btn", title: "Refresh everything now", onclick: refreshAll, text: "Refresh" }),
         el("button", { class: "btn", id: "me", title: "Settings", onclick: openSettings })
@@ -1649,8 +1781,16 @@ function applyBoardWidth(main = document.querySelector(".main")) {
 }
 
 function renderTop() {
+  if (IS_GITCODE) {
+    const select = document.querySelector("#board-repo");
+    const repos = repositoryNames();
+    select.disabled = !repos.length;
+    select.replaceChildren(...(repos.length
+      ? repos.map((repo) => el("option", { value: repo, selected: repo === state.prefs.activeRepo, text: repo }))
+      : [el("option", { value: "", text: "No repositories", disabled: true })]));
+  }
   const counts = Object.fromEntries(FILTERS.map((filter) => [filter.id, 0]));
-  for (const pin of state.board.pins) {
+  for (const pin of boardPins()) {
     const pr = state.data.get(pin.key);
     for (const filter of FILTERS) if (filter.test(pr)) counts[filter.id] += 1;
   }
@@ -1666,9 +1806,12 @@ function renderTop() {
   if (rate !== null) parts.push(throttled ? `rate limit low (${rate}) — paused until ${new Date(state.rate.reset).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : `${rate} api`);
   if (IS_GITCODE) {
     const button = document.querySelector("#monitor-repo");
-    button.textContent = state.prefs.monitoredRepo ? "Stop monitoring" : "Monitor repository";
-    button.title = state.prefs.monitoredRepo ? `Monitoring ${state.prefs.monitoredRepo}. Stop discovering new PRs; existing pins stay.` : state.prefs.defaultRepo ? `Automatically track all open PRs in ${state.prefs.defaultRepo}` : "Choose a repository to monitor";
-    if (state.prefs.monitoredRepo) parts.push(repoMonitor.error || (repoMonitor.loading ? "scanning repository…" : `monitoring ${state.prefs.monitoredRepo}`));
+    const count = state.prefs.monitoredRepos.length;
+    button.textContent = "Add Repo";
+    button.title = "Add or stop repository monitoring";
+    const scans = state.prefs.monitoredRepos.map((repo) => repoMonitors.get(repo));
+    const failed = scans.filter((scan) => scan?.error).length;
+    if (count) parts.push(failed ? `${failed} repository scan${failed === 1 ? "" : "s"} failed — see Add Repo` : scans.some((scan) => scan?.loading) ? "scanning repositories…" : `monitoring ${count} ${count === 1 ? "repository" : "repositories"}`);
   }
   const sync = document.querySelector("#sync");
   sync.className = `sync${busy ? " busy" : ""}${throttled ? " warn" : ""}`;
@@ -1775,7 +1918,7 @@ function verdict(pr, index) {
 
 function renderBoard(index) {
   const board = document.querySelector("#board");
-  if (!state.board.pins.length && state.board.groups.length === 1) {
+  if (!boardPins().length && boardGroups().length <= 1) {
     board.replaceChildren(el("div", { class: "empty" }, [
       el("h2", { text: "Nothing pinned yet" }),
       el("p", { text: "Pin the pull requests you are shepherding. Pingboard keeps their CI, branch freshness and review state in one view, and tells you what each one needs next." }),
@@ -1785,7 +1928,7 @@ function renderBoard(index) {
   }
   const filtering = state.filter !== "all" || state.query.trim();
   const sections = [];
-  for (const group of state.board.groups) {
+  for (const group of boardGroups()) {
     const pins = groupPins(group);
     if (filtering && !pins.length) continue;
     sections.push(el("div", {
@@ -2246,7 +2389,8 @@ function signOut(message = "") {
   refreshQueued.clear();
   refreshAgain.clear();
   state.rate = { remaining: null, limit: null, reset: null };
-  repoMonitor = { at: 0, loading: false, error: "" };
+  repoMonitors.clear();
+  repositoryViews.clear();
   shellMode = null;
   render();
 }
@@ -2321,7 +2465,7 @@ function openPrompt({ title, value = "", placeholder = "", submit, onSubmit }) {
 
 /* Text input over a filterable list. `getItems(query)` returns
    [{id, node}] synchronously; async sources call modal.update() when ready. */
-function openPicker({ title, placeholder, hint, tabs, getItems, onPick, onQuery, onTab }) {
+function openPicker({ title, placeholder, hint, tabs, controls, getItems, onPick, onQuery, onTab }) {
   const list = el("div", { class: "picker-list" });
   const tabRow = el("div", { class: "tabs" });
   const modal = {
@@ -2391,6 +2535,7 @@ function openPicker({ title, placeholder, hint, tabs, getItems, onPick, onQuery,
   if (tabs) modal.tab = tabs[0].id;
   mountModal(modal, el("div", { class: "modal" }, [
     el("h2", { text: title }),
+    controls || null,
     input,
     tabs ? tabRow : null,
     list,
@@ -2409,8 +2554,9 @@ function openPicker({ title, placeholder, hint, tabs, getItems, onPick, onQuery,
 const searchCache = new Map();   // query -> {at, count, nodes}
 
 function openAdd(groupId = targetGroupId()) {
-  const repo = state.prefs.defaultRepo;
-  if (!repo) return chooseDefaultRepo(() => openAdd(groupId));
+  const repo = IS_GITCODE ? state.prefs.activeRepo : state.prefs.defaultRepo;
+  if (!repo) return chooseDefaultRepo(() => openAdd());
+  const group = boardGroups().find((item) => item.id === groupId) || boardGroups()[0];
   const quick = profileFor(repo).quickLabels[0];
   const tabs = [
     { id: "mine", label: "Mine", q: "author:@me" },
@@ -2422,7 +2568,6 @@ function openAdd(groupId = targetGroupId()) {
     { id: "recent", label: "All recent", q: "" }
   ].filter((tab) => !IS_GITCODE || !["reviewed", "involved"].includes(tab.id));
   if (IS_GITCODE) tabs.unshift(tabs.pop());
-  const group = state.board.groups.find((item) => item.id === groupId) || state.board.groups[0];
   const queryFor = (modal) => {
     const tab = tabs.find((item) => item.id === modal.tab);
     // "@name" in the search box is shorthand for GitHub's author:name.
@@ -2431,7 +2576,7 @@ function openAdd(groupId = targetGroupId()) {
   };
   const nobodyFollowed = (modal) => modal.tab === "following" && !state.prefs.following.length;
   const search = async (modal) => {
-    if (parseRefs(modal.query) || nobodyFollowed(modal)) return modal.update();
+    if (parseRefs(modal.query, repo) || nobodyFollowed(modal)) return modal.update();
     const query = queryFor(modal);
     const cached = searchCache.get(query);
     if (cached && Date.now() - cached.at < 60000) return modal.update();
@@ -2452,12 +2597,13 @@ function openAdd(groupId = targetGroupId()) {
   search(openPicker({
     title: `Add pull requests → ${group.name}`,
     placeholder: `Search ${repo}, @author, or paste PR numbers / URLs`,
-    hint: IS_GITCODE ? "Search all open PRs by title or @author; Monitor repository automatically tracks existing and new PRs." : "Click a pull request to pin it; click again to unpin.",
+    hint: IS_GITCODE ? "Search all open PRs by title or @author; Monitor repositories automatically tracks existing and new PRs." : "Click a pull request to pin it; click again to unpin.",
     tabs,
+    controls: el("p", { class: "muted", text: `Repository: ${repo}` }),
     onQuery: searchSoon,
     onTab: search,
     getItems(query, modal) {
-      const refs = parseRefs(query);
+      const refs = parseRefs(query, repo);
       if (refs) {
         modal.emptyText = "";
         return refs.map((ref) => ({
@@ -2496,8 +2642,9 @@ function openAdd(groupId = targetGroupId()) {
     },
     onPick(item, modal) {
       if (!item) return;
-      const refs = parseRefs(modal.query);
+      const refs = parseRefs(modal.query, repo);
       if (refs) {
+        if (IS_GITCODE && refs.some((ref) => ref.repo !== repo)) return toast("Switch to that repository board before adding its PRs", "error");
         const added = refs.filter((ref) => addPin(ref.repo, ref.number, group.id)).length;
         toast(added ? `Pinned ${added} PR${added > 1 ? "s" : ""} to ${group.name}` : "Already pinned");
         modal.input.value = "";
@@ -2556,10 +2703,10 @@ function openGroupPicker(pin = cursorPin()) {
     hint: "Pick a group, or type a new name to create one.",
     getItems(query) {
       const needle = query.trim().toLowerCase();
-      const items = state.board.groups
+      const items = boardGroups()
         .filter((group) => group.name.toLowerCase().includes(needle))
         .map((group) => ({ id: group.id, group, node: el("div", { class: "result" }, [group.name, group.id === pin.group ? el("span", { class: "muted", text: "current" }) : null]) }));
-      if (needle && !state.board.groups.some((group) => group.name.toLowerCase() === needle)) {
+      if (needle && !boardGroups().some((group) => group.name.toLowerCase() === needle)) {
         items.push({ id: "new", name: query.trim(), node: el("div", { class: "result" }, [`Create "${query.trim()}"`]) });
       }
       return items;
