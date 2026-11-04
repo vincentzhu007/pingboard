@@ -1,7 +1,7 @@
 "use strict";
 
 /* Pingboard — a board for the pull requests you are shepherding through CI.
-   Static, no build step: talks to the GitHub API straight from the browser.
+   Static, no build step: talks to GitHub or GitCode straight from the browser.
 
    Sections
      1. constants + utils
@@ -17,12 +17,15 @@
 
 /* ── 1. constants + utils ──────────────────────────────────────────────── */
 
-const TOKEN_KEY = "pingboard.githubToken";
-const SESSION_KEY = "pingboard.sessionToken";
-const API_ROOT = "https://api.github.com";
+const PROVIDER = localStorage.getItem("pingboard.provider") === "gitcode" ? "gitcode" : "github";
+const IS_GITCODE = PROVIDER === "gitcode";
+const PROVIDER_NAME = IS_GITCODE ? "GitCode" : "GitHub";
+const TOKEN_KEY = IS_GITCODE ? "pingboard.gitcodeToken" : "pingboard.githubToken";
+const SESSION_KEY = IS_GITCODE ? "pingboard.gitcodeSessionToken" : "pingboard.sessionToken";
+const API_ROOT = IS_GITCODE ? "https://api.gitcode.com/api/v5" : "https://api.github.com";
 const API_VERSION = "2022-11-28";
 
-const DEFAULT_REPO = "vllm-project/vllm";
+const DEFAULT_REPO = IS_GITCODE ? "" : "vllm-project/vllm";
 const REFRESH_CONCURRENCY = 4;
 const TICK_MS = 15 * 1000;
 const CLOSED_TTL_S = 15 * 60;       // merged/closed PRs barely change
@@ -77,14 +80,14 @@ function normalizeRepoProfiles(raw) {
   const profiles = {};
   for (const [repo, value] of Object.entries(raw)) {
     if (/^[\w.-]+\/[\w.-]+$/.test(repo) && value && typeof value === "object") {
-      profiles[repo] = normalizeProfile(value, REPO_PROFILES[repo] || GENERIC_PROFILE);
+      profiles[repo] = normalizeProfile(value, (!IS_GITCODE && REPO_PROFILES[repo]) || GENERIC_PROFILE);
     }
   }
   return profiles;
 }
 
 function profileFor(repo) {
-  const base = REPO_PROFILES[repo] || GENERIC_PROFILE;
+  const base = (!IS_GITCODE && REPO_PROFILES[repo]) || GENERIC_PROFILE;
   return normalizeProfile(state.prefs.repoProfiles?.[repo], base);
 }
 
@@ -166,9 +169,16 @@ function parseRefs(raw) {
   const refs = [];
   for (const token of raw.trim().split(/[\s,]+/).filter(Boolean)) {
     let match;
-    if ((match = token.match(/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/))) refs.push({ repo: match[1], number: Number(match[2]) });
+    if (/^(?:https?:\/\/|(?:github|gitcode)\.com\/)/i.test(token)) {
+      let url;
+      try { url = new URL(/^https?:\/\//i.test(token) ? token : `https://${token}`); } catch { return null; }
+      const host = IS_GITCODE ? "gitcode.com" : "github.com";
+      match = url.pathname.match(/^\/([\w.-]+\/[\w.-]+)\/(?:pull|pulls|merge_requests)\/(\d+)(?:\/.*)?$/);
+      if (url.hostname !== host || !match) return null;
+      refs.push({ repo: match[1], number: Number(match[2]) });
+    }
     else if ((match = token.match(/^([\w.-]+\/[\w.-]+)#(\d+)$/))) refs.push({ repo: match[1], number: Number(match[2]) });
-    else if ((match = token.match(/^#?(\d+)$/))) refs.push({ repo: state.prefs.defaultRepo, number: Number(match[1]) });
+    else if (state.prefs.defaultRepo && (match = token.match(/^#?(\d+)$/))) refs.push({ repo: state.prefs.defaultRepo, number: Number(match[1]) });
     else return null;
   }
   return refs.length ? refs : null;
@@ -204,7 +214,7 @@ const state = {
 };
 
 function scopedKey(suffix) {
-  return `pingboard.v3.${state.user?.login || "anonymous"}.${suffix}`;
+  return `pingboard.v3.${IS_GITCODE ? "gitcode." : ""}${state.user?.login || "anonymous"}.${suffix}`;
 }
 
 function normalizePrefs(raw) {
@@ -215,6 +225,10 @@ function normalizePrefs(raw) {
     boardWidth: Number(prefs.boardWidth) || BOARD_WIDTH,
     defaultRepo: /^[\w.-]+\/[\w.-]+$/.test(prefs.defaultRepo || "") ? prefs.defaultRepo : DEFAULT_REPO,
     following: parseLogins(Array.isArray(prefs.following) ? prefs.following.join(" ") : ""),
+    ...(IS_GITCODE ? {
+      monitoredRepo: /^[\w.-]+\/[\w.-]+$/.test(prefs.monitoredRepo || "") ? prefs.monitoredRepo : null,
+      ignoredPRs: Array.isArray(prefs.ignoredPRs) ? [...new Set(prefs.ignoredPRs.filter((key) => typeof key === "string" && /^[\w.-]+\/[\w.-]+#\d+$/.test(key)))] : []
+    } : {}),
     repoProfiles: normalizeRepoProfiles(prefs.repoProfiles)
   };
 }
@@ -278,6 +292,7 @@ function exportBoard() {
   const payload = {
     pingboard: 1,
     login: state.user.login,
+    provider: PROVIDER,
     exportedAt: new Date().toISOString(),
     board: state.board,
     // Deliberately copy only non-secret preferences; the GitHub token is never exported.
@@ -293,6 +308,7 @@ async function importBoard(file) {
   let prefs = null;
   try {
     const parsed = JSON.parse(await file.text());
+    if ((parsed.provider || "github") !== PROVIDER) return toast(`This backup belongs to ${parsed.provider || "github"}. Switch platforms before importing it.`, "error");
     board = cleanBoard(parsed.board || parsed);
     if (parsed && typeof parsed === "object" && Object.prototype.hasOwnProperty.call(parsed, "prefs")) {
       prefs = normalizePrefs(parsed.prefs);
@@ -310,7 +326,7 @@ async function importBoard(file) {
   };
   openChoice({
     title: `Import ${count}?`,
-    body: `From ${file.name}.${prefs ? " This backup includes non-secret preferences and repository profiles, but never your GitHub token." : ""} Adding keeps what is on your board now; replacing discards it.`,
+    body: `From ${file.name}.${prefs ? " This backup includes non-secret preferences and repository profiles, but never your token." : ""} Adding keeps what is on your board now; replacing discards it.`,
     options: [
       {
         key: "Enter",
@@ -376,6 +392,7 @@ function persistPrefs() {
 /* ── 3. github api ─────────────────────────────────────────────────────── */
 
 function authHeaders() {
+  if (IS_GITCODE) return { Authorization: `Bearer ${state.token}`, Accept: "application/json" };
   return {
     Authorization: `Bearer ${state.token}`,
     Accept: "application/vnd.github+json",
@@ -389,7 +406,7 @@ async function rest(method, path, body) {
     headers: { ...authHeaders(), ...(body ? { "Content-Type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined
   });
-  if (response.status === 401) signOut("GitHub rejected the token.");
+  if (response.status === 401) signOut(`${PROVIDER_NAME} rejected the token.`);
   const text = await response.text();
   let json = null;
   try {
@@ -402,6 +419,7 @@ async function rest(method, path, body) {
 }
 
 async function gql(query, variables = {}, { strict = false } = {}) {
+  if (IS_GITCODE) throw new Error("GraphQL is not available on GitCode");
   const response = await fetch(`${API_ROOT}/graphql`, {
     method: "POST",
     headers: { ...authHeaders(), "Content-Type": "application/json" },
@@ -415,7 +433,7 @@ async function gql(query, variables = {}, { strict = false } = {}) {
       reset: Number(response.headers.get("x-ratelimit-reset")) * 1000
     };
   }
-  if (response.status === 401) signOut("GitHub rejected the token.");
+  if (response.status === 401) signOut(`${PROVIDER_NAME} rejected the token.`);
   const json = await response.json().catch(() => null);
   // Reads tolerate partial errors (e.g. a ref that cannot be compared) because the
   // rest of the data is usable; a mutation that reports any error did not happen.
@@ -423,6 +441,144 @@ async function gql(query, variables = {}, { strict = false } = {}) {
     throw new Error(json?.errors?.[0]?.message || json?.message || `${response.status} ${response.statusText}`);
   }
   return json.data;
+}
+
+/* GitCode REST v5. Gate booleans describe merge policy, not CI job results. */
+async function fetchGitCodePR(pin) {
+  const path = `/repos/${pin.repo}/pulls/${pin.number}`;
+  const [pr, comments] = await Promise.all([
+    rest("GET", path),
+    rest("GET", `${path}/comments?per_page=30&page=1&direction=desc&comment_type=pr_comment`)
+  ]);
+  if (!pr?.number) throw new Error("Pull request not found (or the token cannot see it)");
+  const gate = pr.mergeable_state || {};
+  const reviews = [...(pr.approval_reviewers || []), ...(pr.assignees || [])]
+    .filter((review) => review?.login)
+    .map((review) => ({ login: review.login, state: review.accept_status === "reject" ? "CHANGES_REQUESTED"
+      : review.accept === true || review.accept_status === "true" ? "APPROVED" : "PENDING" }));
+  const approved = reviews.some((review) => review.state === "APPROVED") && gate.approval_reviewers_required_passed === true && gate.approval_approvers_required_passed === true;
+  return {
+    key: pin.key, repo: pin.repo, number: pr.number, id: pr.id, title: pr.title,
+    url: safeUrl(pr.html_url) || `https://gitcode.com/${pin.repo}/pull/${pr.number}`,
+    state: pr.merged_at || pr.state === "merged" ? "MERGED" : pr.state === "open" ? "OPEN" : "CLOSED",
+    isDraft: Boolean(pr.draft), updatedAt: pr.updated_at, author: pr.user?.login || "ghost",
+    base: pr.base?.ref || "unknown", headOid: pr.head?.sha,
+    mergeable: gate.conflict_passed === false ? "CONFLICTING" : gate.conflict_passed === true ? "MERGEABLE" : "UNKNOWN",
+    mergeState: gate.state === true ? "CLEAN" : "BLOCKED", gitcodeGate: gate,
+    reviewDecision: reviews.some((review) => review.state === "CHANGES_REQUESTED") ? "CHANGES_REQUESTED" : approved ? "APPROVED" : gate.approval_reviewers_required_passed === false || gate.approval_approvers_required_passed === false ? "REVIEW_REQUIRED" : null,
+    canUpdate: false, autoMerge: false, behind: null,
+    labels: (pr.labels || []).map((label) => ({ name: label.name, color: (label.color || "888888").replace(/^#/, "") })),
+    reviews,
+    comments: (comments || []).slice().reverse().map((comment) => ({
+      login: comment.user?.login || "ghost", text: (comment.body || "").slice(0, 700),
+      at: comment.created_at, url: safeUrl(comment.html_url) || safeUrl(pr.html_url)
+    })),
+    checks: [], ci: summarizeCi([], profileFor(pin.repo))
+  };
+}
+
+function gitcodeVerdict(pr) {
+  const gate = pr.gitcodeGate || {};
+  if (pr.isDraft) return { tone: "neutral", text: "Draft", why: "Mark the PR ready on GitCode before merging." };
+  if (pr.mergeable === "CONFLICTING") return { tone: "bad", text: "Merge conflicts", why: `Resolve conflicts with ${pr.base} on GitCode.` };
+  if (gate.state === true) return { tone: "good", text: "GitCode allows merge", why: "GitCode merge requirements are satisfied. CI job details are available on GitCode.", action: { label: "Merge…", run: () => mergeMenu(pr) } };
+  if (gate.ci_state_passed === false) return { tone: "warn", text: "CI gate not satisfied", why: "Open GitCode to see whether CI is pending, running or failed." };
+  if (pr.reviewDecision === "CHANGES_REQUESTED") return { tone: "warn", text: "Changes requested" };
+  if (gate.approval_reviewers_required_passed === false || gate.approval_approvers_required_passed === false) return { tone: "todo", text: "Needs review" };
+  if (gate.approval_testers_required_passed === false) return { tone: "todo", text: "Needs test approval" };
+  return { tone: "neutral", text: "Check merge requirements", why: "Open the PR on GitCode for remaining requirements and CI details." };
+}
+
+/* Read all pages before updating the board; an incomplete scan must not look complete. */
+async function listGitCodePRs(repo, filters = {}, isCurrent = () => true) {
+  const items = new Map();
+  for (let page = 1; page <= 100; page += 1) {
+    if (!isCurrent()) return [];
+    const params = new URLSearchParams({ state: "open", sort: "updated", direction: "desc", per_page: "100", ...filters, page: String(page) });
+    const batch = await rest("GET", `/repos/${repo}/pulls?${params}`);
+    if (!Array.isArray(batch)) throw new Error("GitCode returned an invalid PR list");
+    for (const pr of batch) items.set(pr.number, pr);
+    if (batch.length < 100) return [...items.values()];
+  }
+  throw new Error("PR list exceeded 100 pages; narrow the repository filter");
+}
+
+let repoMonitor = { at: 0, loading: false, error: "" };
+
+function chooseDefaultRepo(then) {
+  openPrompt({
+    title: "Choose a repository", value: "", placeholder: "owner/repo", submit: "Use repository",
+    onSubmit(value) {
+      if (!/^[\w.-]+\/[\w.-]+$/.test(value)) return "Repository must look like owner/repo";
+      state.prefs.defaultRepo = value;
+      persistPrefs();
+      // The prompt closes after onSubmit returns; open the next view afterwards.
+      setTimeout(then, 0);
+    }
+  });
+}
+
+function toggleRepoMonitor() {
+  if (!state.prefs.monitoredRepo && !state.prefs.defaultRepo) return chooseDefaultRepo(toggleRepoMonitor);
+  state.prefs.monitoredRepo = state.prefs.monitoredRepo ? null : state.prefs.defaultRepo;
+  repoMonitor = { at: 0, loading: false, error: "" };
+  persistPrefs();
+  tick();
+}
+
+async function refreshRepoMonitor(force = false) {
+  const repo = state.prefs.monitoredRepo;
+  if (!IS_GITCODE || !repo || !state.user || repoMonitor.loading) return;
+  const interval = state.prefs.interval * 1000 * (document.hidden ? HIDDEN_SLOWDOWN : 1);
+  if (!force && Date.now() - repoMonitor.at < interval) return;
+  const scan = repoMonitor;
+  const user = state.user;
+  const isCurrent = () => state.user === user && state.prefs.monitoredRepo === repo && repoMonitor === scan;
+  scan.loading = true;
+  render();
+  try {
+    const prs = await listGitCodePRs(repo, {}, isCurrent);
+    if (!isCurrent()) return;
+    const ignored = new Set(state.prefs.ignoredPRs);
+    const fresh = prs.filter((pr) => !pinByKey(pinKey(repo, pr.number)) && !ignored.has(pinKey(repo, pr.number)));
+    if (fresh.length) {
+      const group = ensureGroup(repo);
+      for (const pr of fresh) addPin(repo, pr.number, group.id);
+      toast(`Added ${fresh.length} open PR${fresh.length === 1 ? "" : "s"} from ${repo}`);
+    }
+    scan.error = "";
+  } catch (error) {
+    if (isCurrent()) scan.error = `Repository scan failed: ${error.message}`;
+  } finally {
+    scan.at = Date.now();
+    scan.loading = false;
+    if (isCurrent()) render();
+  }
+}
+
+async function searchGitCodePRs(repo, modal) {
+  const authors = [...modal.query.matchAll(/(?:^|\s)@([\w.-]+)/g)].map((match) => match[1]);
+  const title = modal.query.replace(/(?:^|\s)@[\w.-]+/g, " ").trim().toLowerCase();
+  const authorFilters = authors.length ? authors : modal.tab === "mine" ? [state.user.login]
+    : modal.tab === "following" ? state.prefs.following : [null];
+  const byNumber = new Map();
+  // Sequential requests avoid a burst when a user follows many authors.
+  for (const author of authorFilters) {
+    const filters = {};
+    if (author) filters.author = author;
+    if (modal.tab === "requested") filters.reviewer = state.user.login;
+    if (modal.tab === "quick") filters.labels = profileFor(repo).quickLabels[0];
+    const prs = await listGitCodePRs(repo, filters);
+    for (const pr of prs) {
+      if (!pr.title.toLowerCase().includes(title)) continue;
+      byNumber.set(pr.number, {
+        number: pr.number, title: pr.title, updatedAt: pr.updated_at, author: pr.user,
+        repository: { nameWithOwner: repo }, labels: { nodes: pr.labels || [] }, commits: { nodes: [] }
+      });
+    }
+  }
+  const nodes = [...byNumber.values()].sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+  return { search: { issueCount: nodes.length, nodes } };
 }
 
 const CONTEXT_FIELDS = `
@@ -598,6 +754,7 @@ function summarizeCi(checks, profile) {
 }
 
 async function fetchPR(pin, { force = false } = {}) {
+  if (IS_GITCODE) return fetchGitCodePR(pin);
   const prev = state.data.get(pin.key);
   const [owner, name] = pin.repo.split("/");
   const headRef = `refs/pull/${pin.number}/head`;
@@ -667,7 +824,7 @@ async function fetchPR(pin, { force = false } = {}) {
 
 /* What the user has "seen" for a PR; a different signature lights the change dot. */
 function signature(pr) {
-  return [pr.state, pr.headOid, pr.ci.state, pr.ci.fail, pr.reviewDecision].join("|");
+  return [pr.state, pr.headOid, pr.ci.state, pr.ci.fail, pr.reviewDecision, ...(IS_GITCODE ? [JSON.stringify(pr.gitcodeGate)] : [])].join("|");
 }
 
 function hasChanged(pin) {
@@ -743,7 +900,7 @@ async function refreshBaseline(repo, base) {
 }
 
 async function loadLabels(repo) {
-  const cached = state.labels.get(repo) || store.get(`pingboard.v3.labels.${repo}`, null);
+  const cached = state.labels.get(repo) || store.get(`pingboard.v3.labels.${IS_GITCODE ? "gitcode." : ""}${repo}`, null);
   if (cached && Date.now() - cached.at < LABELS_TTL_MS) {
     state.labels.set(repo, cached);
     return cached.items;
@@ -756,7 +913,7 @@ async function loadLabels(repo) {
   }
   const entry = { at: Date.now(), items };
   state.labels.set(repo, entry);
-  store.set(`pingboard.v3.labels.${repo}`, entry);
+  store.set(`pingboard.v3.labels.${IS_GITCODE ? "gitcode." : ""}${repo}`, entry);
   return items;
 }
 
@@ -836,6 +993,7 @@ function announceCi(pr) {
 /* Keep the base-branch failure baseline fresh for every base an open PR targets.
    A failed read just leaves the previous baseline in place until the next try. */
 function refreshBaselines() {
+  if (IS_GITCODE) return; // GitCode does not expose GitHub status-check history.
   const now = Date.now();
   for (const pr of state.data.values()) {
     const key = `${pr.repo}@${pr.base}`;
@@ -862,11 +1020,13 @@ function tick() {
       if (!status?.at || now - status.at >= ttl) queueRefresh(pin);
     }
     refreshBaselines();
+    refreshRepoMonitor();
   }
   render();
 }
 
 function refreshAll() {
+  refreshRepoMonitor(true);
   for (const pin of state.board.pins) queueRefresh(pin, { force: true });
   state.baselines.clear();
 }
@@ -903,6 +1063,10 @@ function targetGroupId() {
 function addPin(repo, number, group = targetGroupId()) {
   const key = pinKey(repo, number);
   if (pinByKey(key)) return false;
+  if (IS_GITCODE && state.prefs.ignoredPRs?.includes(key)) {
+    state.prefs.ignoredPRs = state.prefs.ignoredPRs.filter((item) => item !== key);
+    persistPrefs();
+  }
   const pin = { key, repo, number, group, addedAt: Date.now() };
   state.board.pins.push(pin);
   // Ask the browser not to evict this site's storage under disk pressure.
@@ -918,6 +1082,10 @@ function addPin(repo, number, group = targetGroupId()) {
 function removePin(key) {
   const pin = pinByKey(key);
   if (!pin) return;
+  if (IS_GITCODE && state.prefs.monitoredRepo === pin.repo) {
+    state.prefs.ignoredPRs = [...new Set([...state.prefs.ignoredPRs, key])];
+    persistPrefs();
+  }
   const visible = visiblePins();
   const at = visible.findIndex((item) => item.key === key);
   const index = state.board.pins.indexOf(pin);
@@ -931,6 +1099,10 @@ function removePin(key) {
     run: () => {
       if (pinByKey(key)) return;
       if (!state.board.groups.some((group) => group.id === pin.group)) pin.group = state.board.groups[0].id;
+      if (IS_GITCODE) {
+        state.prefs.ignoredPRs = state.prefs.ignoredPRs.filter((item) => item !== key);
+        persistPrefs();
+      }
       state.board.pins.splice(Math.min(index, state.board.pins.length), 0, pin);
       persistBoard();
       queueRefresh(pin);
@@ -1045,7 +1217,15 @@ function shiftPin(delta) {
   scrollCursorIntoView();
 }
 
-const FILTERS = [
+const FILTERS = IS_GITCODE ? [
+  { id: "all", label: "All", test: () => true },
+  { id: "review", label: "Needs review", test: (pr) => pr?.state === "OPEN" && (pr.reviewDecision === "REVIEW_REQUIRED" || pr.reviewDecision === "CHANGES_REQUESTED") },
+  { id: "ci", label: "CI gate", test: (pr) => pr?.state === "OPEN" && pr.gitcodeGate?.ci_state_passed === false },
+  { id: "conflicts", label: "Conflicts", test: (pr) => pr?.state === "OPEN" && pr.mergeable === "CONFLICTING" },
+  { id: "blocked", label: "Blocked", test: (pr) => pr?.state === "OPEN" && pr.gitcodeGate?.state === false },
+  { id: "ready", label: "Merge allowed", test: (pr) => pr?.state === "OPEN" && !pr.isDraft && pr.gitcodeGate?.state === true },
+  { id: "closed", label: "Closed", test: (pr) => Boolean(pr) && pr.state !== "OPEN" }
+] : [
   { id: "all", label: "All", test: () => true },
   { id: "failing", label: "Failing", test: (pr) => pr?.state === "OPEN" && pr.ci.fail > 0 },
   { id: "running", label: "Running", test: (pr) => pr?.state === "OPEN" && pr.ci.state === "running" },
@@ -1164,7 +1344,7 @@ function undoPending() {
 
 function postComment(pr, body) {
   defer(`${body} → ${shortRef(pr.repo, pr.number)}`, async () => {
-    await rest("POST", `/repos/${pr.repo}/issues/${pr.number}/comments`, { body });
+    await rest("POST", `/repos/${pr.repo}/${IS_GITCODE ? "pulls" : "issues"}/${pr.number}/comments`, { body });
     refreshSoon(pr.key);
   });
 }
@@ -1208,7 +1388,7 @@ function updateBranch(pr = cursorPR(), thenComment = null) {
       await sleep(3000);
       const fresh = await fetchPR(ref, { force: true });
       if (fresh.headOid === before) continue;
-      await rest("POST", `/repos/${pr.repo}/issues/${pr.number}/comments`, { body: thenComment });
+      await rest("POST", `/repos/${pr.repo}/${IS_GITCODE ? "pulls" : "issues"}/${pr.number}/comments`, { body: thenComment });
       return refreshSoon(pr.key);
     }
     throw new Error(`the updated commit did not appear, so ${thenComment} was not posted`);
@@ -1216,6 +1396,7 @@ function updateBranch(pr = cursorPR(), thenComment = null) {
 }
 
 async function toggleLabel(pr, name) {
+  if (IS_GITCODE) return openUrl(pr?.url);
   if (!pr || pr.state !== "OPEN") return closedNotice(pr);
   const had = pr.labels.some((label) => label.name === name);
   const before = pr.labels;
@@ -1250,7 +1431,8 @@ function approve(pr = cursorPR()) {
       key: "Enter",
       label: "Submit approving review",
       run: () => perform(`Approve ${ref}`, async () => {
-        await rest("POST", `/repos/${pr.repo}/pulls/${pr.number}/reviews`, { event: "APPROVE", commit_id: pr.headOid });
+        await rest("POST", `/repos/${pr.repo}/pulls/${pr.number}/${IS_GITCODE ? "review" : "reviews"}`,
+          IS_GITCODE ? { force: false } : { event: "APPROVE", commit_id: pr.headOid });
         refreshSoon(pr.key);
       })
     }]
@@ -1270,21 +1452,29 @@ function mergeMenu(pr = cursorPR()) {
   });
   openChoice({
     title: `Merge ${ref}`,
-    body: `${pr.title} · CI ${pr.ci.state}${pr.ci.fail ? ` (${pr.ci.fail} failed)` : ""} · ${reviewWord(pr) || "no review decision"}`,
+    body: IS_GITCODE ? `${pr.title} · GitCode rechecks merge requirements. Its merge API cannot lock the merge to a specific commit.` : `${pr.title} · CI ${pr.ci.state}${pr.ci.fail ? ` (${pr.ci.fail} failed)` : ""} · ${reviewWord(pr) || "no review decision"}`,
     options: [
-      pr.autoMerge
+      !IS_GITCODE && (pr.autoMerge
         ? { key: "a", label: "Disable auto-merge", run: () => autoMerge(false) }
-        : { key: "a", label: `Enable auto-merge (${method})`, run: () => autoMerge(true) },
+        : { key: "a", label: `Enable auto-merge (${method})`, run: () => autoMerge(true) }),
       {
         key: "m",
         label: `${method[0].toUpperCase()}${method.slice(1)} and merge now`,
         danger: true,
         run: () => perform(`Merge ${ref}`, async () => {
-          await rest("PUT", `/repos/${pr.repo}/pulls/${pr.number}/merge`, { merge_method: method, sha: pr.headOid });
+          if (IS_GITCODE) {
+            const fresh = await fetchGitCodePR(pr);
+            if (fresh.headOid !== pr.headOid) throw new Error("The head commit changed. Refresh and review it before merging.");
+            if (!fresh.gitcodeGate?.state) throw new Error("GitCode has not allowed this merge. Check the PR on GitCode.");
+          }
+          const merged = await rest("PUT", `/repos/${pr.repo}/pulls/${pr.number}/merge`, IS_GITCODE
+            ? { merge_method: method === "squash" ? "merge" : method, squash: method === "squash", force_merge: false }
+            : { merge_method: method, sha: pr.headOid });
+          if (merged?.merged === false || merged?.merged === 0) throw new Error(merged.message || "The pull request was not merged");
           refreshSoon(pr.key);
         })
       }
-    ]
+    ].filter(Boolean)
   });
 }
 
@@ -1405,6 +1595,7 @@ function buildShell() {
       }),
       el("div", { class: "top-right" }, [
         el("span", { class: "sync", id: "sync" }),
+        IS_GITCODE ? el("button", { class: "btn", id: "monitor-repo", onclick: toggleRepoMonitor }) : null,
         el("button", { class: "btn primary", onclick: () => openAdd(), text: "+ Add PRs" }),
         el("button", { class: "btn", title: "Refresh everything now", onclick: refreshAll, text: "Refresh" }),
         el("button", { class: "btn", id: "me", title: "Settings", onclick: openSettings })
@@ -1473,6 +1664,12 @@ function renderTop() {
   const throttled = rate !== null && rate < RATE_FLOOR;
   const parts = [busy ? "syncing…" : state.lastSync ? `synced ${ago(state.lastSync)} ago` : ""];
   if (rate !== null) parts.push(throttled ? `rate limit low (${rate}) — paused until ${new Date(state.rate.reset).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : `${rate} api`);
+  if (IS_GITCODE) {
+    const button = document.querySelector("#monitor-repo");
+    button.textContent = state.prefs.monitoredRepo ? "Stop monitoring" : "Monitor repository";
+    button.title = state.prefs.monitoredRepo ? `Monitoring ${state.prefs.monitoredRepo}. Stop discovering new PRs; existing pins stay.` : state.prefs.defaultRepo ? `Automatically track all open PRs in ${state.prefs.defaultRepo}` : "Choose a repository to monitor";
+    if (state.prefs.monitoredRepo) parts.push(repoMonitor.error || (repoMonitor.loading ? "scanning repository…" : `monitoring ${state.prefs.monitoredRepo}`));
+  }
   const sync = document.querySelector("#sync");
   sync.className = `sync${busy ? " busy" : ""}${throttled ? " warn" : ""}`;
   sync.textContent = parts.filter(Boolean).join(" · ");
@@ -1483,6 +1680,8 @@ function renderTop() {
 function verdict(pr, index) {
   if (pr.state === "MERGED") return { tone: "done", text: "Merged" };
   if (pr.state === "CLOSED") return { tone: "done", text: "Closed" };
+
+  if (IS_GITCODE) return gitcodeVerdict(pr);
 
   const ci = pr.ci;
   const commands = profileFor(pr.repo).ciCommands;
@@ -1703,7 +1902,7 @@ function row(pin, index) {
         el("span", { class: "title-text", text: pr.title, title: pr.title })
       ]),
       el("div", { class: "row-meta" }, [
-        el("a", { class: "num", href: pr.url, target: "_blank", rel: "noopener", title: "Open on GitHub", onclick: (event) => event.stopPropagation(), text: shortRef(pr.repo, pr.number) }),
+        el("a", { class: "num", href: pr.url, target: "_blank", rel: "noopener", title: `Open on ${PROVIDER_NAME}`, onclick: (event) => event.stopPropagation(), text: shortRef(pr.repo, pr.number) }),
         authorName(pr.author),
         el("span", { title: new Date(pr.updatedAt).toLocaleString(), text: `updated ${ago(pr.updatedAt)} ago` }),
         review ? el("span", { class: pr.reviewDecision === "APPROVED" ? "t-good" : "t-bad", text: review }) : null,
@@ -1787,7 +1986,7 @@ function renderDetail(index) {
 
   blocks.push(el("div", { class: "detail-head" }, [
     el("div", { class: "btn-row detail-tools" }, [
-      btn("Open on GitHub ↗", () => openUrl(pr.url)),
+      btn(`Open on ${PROVIDER_NAME} ↗`, () => openUrl(pr.url)),
       btn("Move to group…", () => openGroupPicker(pin)),
       btn("Refresh", () => queueRefresh(pin, { force: true })),
       btn("Unpin", () => removePin(pr.key))
@@ -1800,7 +1999,7 @@ function renderDetail(index) {
       el("span", { class: "muted", text: `updated ${ago(pr.updatedAt)} ago` })
     ]),
     el("h2", { text: pr.title }),
-    el("div", { class: "muted small", text: `+${pr.additions} −${pr.deletions} in ${pr.files} file${pr.files === 1 ? "" : "s"} · last commit ${ago(pr.headDate)} ago` })
+    el("div", { class: "muted small", text: IS_GITCODE ? `Head commit ${(pr.headOid || "unknown").slice(0, 12)}` : `+${pr.additions} −${pr.deletions} in ${pr.files} file${pr.files === 1 ? "" : "s"} · last commit ${ago(pr.headDate)} ago` })
   ]));
 
   blocks.push(el("div", { class: `banner tone-${result.tone}` }, [
@@ -1815,7 +2014,7 @@ function renderDetail(index) {
     const build = ci.builds.map((item) => item.desc).filter(Boolean)[0];
     primary.push(panel("CI", [
       ci.state === "none"
-        ? el("div", { class: "muted", text: commands ? "No build on the latest commit." : "No checks reported." })
+        ? el("div", { class: "muted", text: IS_GITCODE ? (pr.gitcodeGate?.ci_state_passed === false ? "CI merge gate is not satisfied. " : "") + "Job details and base-branch failure history are unavailable here. Open the PR on GitCode to inspect CI." : commands ? "No build on the latest commit." : "No checks reported." })
         : ciLine({ ...pr, behind: 0 }),
       build ? el("div", { class: "muted small", text: build }) : null,
       el("div", { class: "btn-row" }, [
@@ -1863,8 +2062,8 @@ function renderDetail(index) {
     side.push(panel("Labels", [
       pr.labels.length ? el("div", { class: "label-wrap" }, pr.labels.map(labelChip)) : el("div", { class: "muted", text: "No labels" }),
       el("div", { class: "btn-row" }, [
-        ...profile.quickLabels.map((name) => btn(hasLabel(name) ? `Remove ${name}` : `Add ${name}`, () => toggleLabel(pr, name))),
-        btn("Edit labels…", () => openLabels(pr))
+        ...(!IS_GITCODE ? profile.quickLabels : []).map((name) => btn(hasLabel(name) ? `Remove ${name}` : `Add ${name}`, () => toggleLabel(pr, name))),
+        btn(IS_GITCODE ? "Edit labels on GitCode ↗" : "Edit labels…", () => IS_GITCODE ? openUrl(pr.url) : openLabels(pr))
       ])
     ]));
   }
@@ -1954,7 +2153,7 @@ function buildAuth() {
     type: "password",
     autocomplete: "off",
     spellcheck: "false",
-    placeholder: "ghp_…",
+    placeholder: IS_GITCODE ? "GitCode personal access token" : "ghp_…",
     value: state.token,
     oninput: (event) => {
       state.token = event.target.value.trim();
@@ -1966,9 +2165,17 @@ function buildAuth() {
   return el("section", { class: "auth" }, [
     el("div", { class: "brand large" }, [el("span", { class: "brand-dot" }), "Pingboard"]),
     el("p", { class: "auth-sub", text: "One compact board for the pull requests you are shepherding through CI — status, failures, branch freshness and the usual maintainer actions, without a tab per PR." }),
-    el("label", { for: "token", text: "GitHub classic token" }),
+    el("label", { for: "provider", text: "Platform" }),
+    el("select", { id: "provider", disabled: state.authLoading, onchange: (event) => {
+      localStorage.setItem("pingboard.provider", event.target.value);
+      location.reload();
+    } }, [
+      el("option", { value: "github", selected: !IS_GITCODE, text: "GitHub" }),
+      el("option", { value: "gitcode", selected: IS_GITCODE, text: "GitCode" })
+    ]),
+    el("label", { for: "token", text: IS_GITCODE ? "GitCode personal access token" : "GitHub classic token" }),
     input,
-    el("p", { class: "muted small" }, [
+    el("p", { class: "muted small" }, IS_GITCODE ? ["Use a GitCode personal access token with access to your repositories. Actions run as you. The token stays in this browser and is sent only to api.gitcode.com."] : [
       "Scope ", el("code", { text: "repo" }), " (or ", el("code", { text: "public_repo" }),
       " for public repositories only). It acts as you: comments, labels, reviews and merges are made under your account. The token stays in this browser and is sent only to api.github.com."
     ]),
@@ -1994,6 +2201,7 @@ async function connect() {
   rerenderAuth();
   try {
     const user = await rest("GET", "/user");
+    if (!user?.login) throw new Error("The platform did not return a user login");
     if (state.remember) {
       localStorage.setItem(TOKEN_KEY, state.token);
       sessionStorage.removeItem(SESSION_KEY);
@@ -2030,6 +2238,15 @@ function signOut(message = "") {
   state.authError = message;
   state.data.clear();
   state.status.clear();
+  state.baselines.clear();
+  state.commitFailures.clear();
+  state.labels.clear();
+  searchCache.clear();
+  refreshQueue.length = 0;
+  refreshQueued.clear();
+  refreshAgain.clear();
+  state.rate = { remaining: null, limit: null, reset: null };
+  repoMonitor = { at: 0, loading: false, error: "" };
   shellMode = null;
   render();
 }
@@ -2193,6 +2410,7 @@ const searchCache = new Map();   // query -> {at, count, nodes}
 
 function openAdd(groupId = targetGroupId()) {
   const repo = state.prefs.defaultRepo;
+  if (!repo) return chooseDefaultRepo(() => openAdd(groupId));
   const quick = profileFor(repo).quickLabels[0];
   const tabs = [
     { id: "mine", label: "Mine", q: "author:@me" },
@@ -2202,7 +2420,8 @@ function openAdd(groupId = targetGroupId()) {
     { id: "following", label: "Following", q: state.prefs.following.map((login) => `author:${login}`).join(" ") },
     ...(quick ? [{ id: "quick", label: quick, q: `label:${quick}` }] : []),
     { id: "recent", label: "All recent", q: "" }
-  ];
+  ].filter((tab) => !IS_GITCODE || !["reviewed", "involved"].includes(tab.id));
+  if (IS_GITCODE) tabs.unshift(tabs.pop());
   const group = state.board.groups.find((item) => item.id === groupId) || state.board.groups[0];
   const queryFor = (modal) => {
     const tab = tabs.find((item) => item.id === modal.tab);
@@ -2219,7 +2438,7 @@ function openAdd(groupId = targetGroupId()) {
     modal.loading = true;
     modal.update();
     try {
-      const data = await gql(SEARCH_QUERY, { query });
+      const data = IS_GITCODE ? await searchGitCodePRs(repo, modal) : await gql(SEARCH_QUERY, { query });
       searchCache.set(query, { at: Date.now(), count: data.search.issueCount, nodes: data.search.nodes.filter((node) => node?.number) });
       modal.error = "";
     } catch (error) {
@@ -2233,7 +2452,7 @@ function openAdd(groupId = targetGroupId()) {
   search(openPicker({
     title: `Add pull requests → ${group.name}`,
     placeholder: `Search ${repo}, @author, or paste PR numbers / URLs`,
-    hint: "Click a pull request to pin it; click again to unpin.",
+    hint: IS_GITCODE ? "Search all open PRs by title or @author; Monitor repository automatically tracks existing and new PRs." : "Click a pull request to pin it; click again to unpin.",
     tabs,
     onQuery: searchSoon,
     onTab: search,
@@ -2294,6 +2513,7 @@ function openAdd(groupId = targetGroupId()) {
 }
 
 function openLabels(pr = cursorPR()) {
+  if (IS_GITCODE) return openUrl(pr?.url);
   if (!pr || pr.state !== "OPEN") return;
   let all = state.labels.get(pr.repo)?.items || [];
   const appliedAtOpen = new Set(pr.labels.map((label) => label.name));
@@ -2361,10 +2581,10 @@ function openSettings() {
   });
   const NEW_PROFILE = "__new_profile__";
   const profileRepos = [...new Set([
-    ...Object.keys(REPO_PROFILES),
+    ...Object.keys(IS_GITCODE ? {} : REPO_PROFILES),
     ...Object.keys(state.prefs.repoProfiles),
     state.prefs.defaultRepo
-  ])].sort();
+  ])].filter(Boolean).sort();
   const profileSelect = el("select", { onchange: loadProfile }, [
     ...profileRepos.map((repo) => el("option", { value: repo, selected: repo === state.prefs.defaultRepo, text: repo })),
     el("option", { value: NEW_PROFILE, text: "New repository…" })
@@ -2392,7 +2612,7 @@ function openSettings() {
     if (!/^[\w.-]+\/[\w.-]+$/.test(profileRepo) || !Object.prototype.hasOwnProperty.call(state.prefs.repoProfiles, profileRepo)) return;
     openChoice({
       title: `Delete saved profile for ${profileRepo}?`,
-      body: REPO_PROFILES[profileRepo]
+      body: !IS_GITCODE && REPO_PROFILES[profileRepo]
         ? "This will restore the built-in defaults for this repository."
         : "This removes the repository's saved workflow settings from this browser.",
       options: [{
@@ -2404,7 +2624,7 @@ function openSettings() {
           delete profiles[profileRepo];
           state.prefs.repoProfiles = profiles;
           persistPrefs();
-          toast(REPO_PROFILES[profileRepo] ? `Restored built-in profile for ${profileRepo}` : `Deleted profile for ${profileRepo}`);
+          toast(!IS_GITCODE && REPO_PROFILES[profileRepo] ? `Restored built-in profile for ${profileRepo}` : `Deleted profile for ${profileRepo}`);
         }
       }]
     });
@@ -2431,7 +2651,7 @@ function openSettings() {
   const save = async () => {
     const repo = repoInput.value.trim();
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return toast("Default repository must look like owner/name", "error");
-    const profileRepo = profileSelect.value === NEW_PROFILE ? profileRepoInput.value.trim() : profileSelect.value;
+    const profileRepo = profileSelect.value === NEW_PROFILE ? profileRepoInput.value.trim() || repo : profileSelect.value;
     if (!/^[\w.-]+\/[\w.-]+$/.test(profileRepo)) return toast("Workflow repository must look like owner/name", "error");
     const commands = Object.fromEntries(PROFILE_COMMAND_KEYS.map((key) => [key, commandInputs[key].value.trim()]));
     const hasCommands = PROFILE_COMMAND_KEYS.some((key) => commands[key]);
@@ -2447,7 +2667,7 @@ function openSettings() {
         ciCommands: hasCommands ? commands : null,
         quickLabels: quickLabels.value.split(",").map((label) => label.trim()).filter(Boolean),
         mergeMethod: mergeMethod.value
-      }, REPO_PROFILES[profileRepo] || GENERIC_PROFILE)
+      }, (!IS_GITCODE && REPO_PROFILES[profileRepo]) || GENERIC_PROFILE)
     };
     if (notify.checked && "Notification" in window && Notification.permission !== "granted") {
       state.prefs.notify = (await Notification.requestPermission()) === "granted";
@@ -2459,7 +2679,7 @@ function openSettings() {
   loadProfile();
   mountModal({}, el("div", { class: "modal settings-modal" }, [
     el("div", { class: "settings-body" }, [
-      el("h2", { text: `Settings · ${state.user.login}` }),
+      el("h2", { text: `Settings · ${PROVIDER_NAME} · ${state.user.login}` }),
       el("label", { class: "field" }, ["Default repository", repoInput]),
       el("p", { class: "muted small", text: "Used for bare PR numbers and for the Add PRs lists." }),
       el("h2", { text: "Repository workflow" }),
@@ -2515,7 +2735,7 @@ function openSettings() {
 const HELP = [
   ["j / k", "move down / up"],
   ["shift+j / shift+k", "reorder within the group"],
-  ["o / Enter", "open the PR on GitHub"],
+  ["o / Enter", `open the PR on ${PROVIDER_NAME}`],
   ["b", "open the CI build"],
   ["a", "add PRs (search, lists, paste numbers or URLs)"],
   ["g", "move to a group (or create one)"],

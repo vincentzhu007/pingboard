@@ -4,7 +4,24 @@ One board for the pull requests you are shepherding through CI. Pin the PRs you 
 
 <img width="1668" height="1027" alt="Screenshot 2026-10-08 at 12 57 06 PM" src="https://github.com/user-attachments/assets/458d4cbf-d81b-4962-937f-36c99a792ed9" />
 
-It is a static page that talks to the GitHub API from your browser: no server, no build step, no dependencies. It is tuned for [vllm-project/vllm](https://github.com/vllm-project/vllm) and works for any repository.
+It is a static page that talks to the GitHub or GitCode API from your browser: no server, no build step, no dependencies. It is tuned for [vllm-project/vllm](https://github.com/vllm-project/vllm) and supports other repositories through workflow profiles.
+
+## GitCode
+
+Choose **GitCode** on the sign-in screen and enter a GitCode personal access token. No GitCode repository is preselected. The first time you add PRs or start monitoring, enter `owner/repo`; change it later in **Settings → Default repository**. Pin PRs using `42`, `owner/repo#42`, or `https://gitcode.com/owner/repo/pull/42` (also accepts `/pulls/` and `/merge_requests/`). Sign out to choose another platform.
+
+For maintainer monitoring, click **Monitor repository** after signing in. All currently open PRs are pinned in a repository group, and each refresh discovers new PRs automatically. Closed and merged PRs remain visible until you clear them. Unpinning a PR excludes it from future discovery; manually pin it again to resume tracking. **Stop monitoring** stops discovery without removing pins. Monitoring resumes after reload and runs only while this page is open (background tabs refresh more slowly); it is not a server-side monitor. Scans are paginated, and failures appear in the top bar without applying a partial list. The watched repository stays fixed even if you change the default; stop and restart monitoring to watch the new default.
+
+GitCode support includes:
+
+- PR discovery (Mine, Review requested, Following, quick label, All recent), title filtering and `@author`. Lists read every page of open PRs; All recent is the default view.
+- Pinned PR refresh, open/closed/merged and draft states, conflicts, review requirements, labels and the latest 30 ordinary comments.
+- Configured CI comment commands, approval and merge with confirmation. Squash maps to GitCode's `merge_method: merge` plus `squash: true`. Forced merge is never requested. Before merging, the head commit and merge permission are rechecked; GitCode's merge API does not support an atomic expected-head-SHA guard, so a concurrent push can still race that check.
+- Separate tokens, boards, preferences and backups for each platform. Existing GitHub storage stays compatible. Tokens are sent in authorization headers only to the selected platform's fixed API host, never in URLs or backups. Backups cannot be imported into the other platform.
+
+GitCode merge gates are shown separately from CI results: a satisfied CI gate does **not** imply jobs ran or passed. Individual jobs, base-branch failure history, branch-behind counts, branch updates and auto-merge are not available in this integration. Label editing opens the PR on GitCode. The GitCode board has Needs review, CI gate, Conflicts, Blocked and Merge allowed filters. Configure comment commands only if your repository's bot supports them.
+
+The adapter uses [GitCode REST v5 authentication](https://docs.gitcode.com/en/docs/guide/), [PR details](https://docs.gitcode.com/en/docs/apis/get-api-v-5-repos-owner-repo-pulls-number/) and the [merge API](https://docs.gitcode.com/docs/apis/put-api-v-5-repos-owner-repo-pulls-number-merge/). As a static app it requires the API to allow browser cross-origin requests; connection errors are displayed on the sign-in screen.
 
 ## The board
 
@@ -45,11 +62,11 @@ Everything is done as you, with your token.
 
 Keyboard shortcuts exist for all of it; press `?` for the list.
 
-## Token
+## GitHub token
 
 Pingboard takes a **classic** personal access token with the `repo` scope (`public_repo` is enough for public repositories). It is sent only from your browser to `api.github.com`, and is kept in `sessionStorage` — or `localStorage` if you tick "Keep token after closing this tab". The board itself (pins, groups, preferences) lives in `localStorage` per GitHub login, so it belongs to one browser and one address. Settings has **Export board + settings** and **Import board + settings** buttons to back it up or move it. The backup never includes the GitHub token.
 
-## Refresh and rate limits
+## GitHub refresh and rate limits
 
 Open PRs refresh every 60 seconds by default (configurable), background tabs five times slower, at one GraphQL request per PR. The base-branch baseline covers the last 30 commits and is re-read every 10 minutes. Remaining API quota is shown in the top bar, and polling pauses if it runs low.
 
@@ -74,3 +91,7 @@ The included workflow publishes the folder to GitHub Pages on every push to `mai
 ```
 
 Runs the checks every pull request has to pass. It needs [Bun](https://bun.sh) and installs everything else itself.
+
+If Bun is unavailable, install the test dependencies with `cd tests && npm install --ignore-scripts --no-package-lock`, run `npx playwright install chromium`, then `node state-compat.mjs --head ..` and `node gitcode.mjs --head ..`. The GitCode browser tests mock all API requests; they never modify a real repository.
+
+To reuse an installed browser, set `PINGBOARD_BROWSER` to its executable path when running the Node test commands. Tests launch a separate temporary profile.
