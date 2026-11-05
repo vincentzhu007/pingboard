@@ -16,7 +16,7 @@ Closed and merged PRs remain visible until you clear them. Unpinning a PR exclud
 
 Use the **Repository board** selector in the top bar only to switch existing repositories. Add repositories using **Add Repo** on the right. Each board shows only its own PRs and groups. Groups with the same name in different repositories are independent; filters, search text and selection are remembered per board during the session. The active repository survives reloads, while all monitored repositories continue refreshing in the background.
 
-**+ Add PRs** and a group's **+ Add** browse the current repository. Click a PR to pin or unpin it; bare numbers also refer to the current board. To add a PR from another repository, switch boards first. Pinning or unpinning `#42` in one repository never changes `#42` in another. Existing mixed-repository groups are split automatically, preserving their names and pins. Backups include all repository boards.
+**+ Add PRs** and a group's **+ PR** browse the current repository. Click a PR to pin or unpin it; bare numbers also refer to the current board. To add a PR from another repository, switch boards first. Pinning or unpinning `#42` in one repository never changes `#42` in another. Existing mixed-repository groups are split automatically, preserving their names and pins. Backups include all repository boards.
 
 GitCode support includes:
 
@@ -28,6 +28,16 @@ GitCode support includes:
 GitCode merge gates are shown separately from CI results: a satisfied CI gate does **not** imply jobs ran or passed. Individual jobs, base-branch failure history, branch-behind counts, branch updates and auto-merge are not available in this integration. Label editing opens the PR on GitCode. The GitCode board has Needs review, CI gate, Conflicts, Blocked and Merge allowed filters. Configure comment commands only if your repository's bot supports them.
 
 The adapter uses [GitCode REST v5 authentication](https://docs.gitcode.com/en/docs/guide/), [PR details](https://docs.gitcode.com/en/docs/apis/get-api-v-5-repos-owner-repo-pulls-number/) and the [merge API](https://docs.gitcode.com/docs/apis/put-api-v-5-repos-owner-repo-pulls-number-merge/). As a static app it requires the API to allow browser cross-origin requests; connection errors are displayed on the sign-in screen.
+
+## Issue monitoring
+
+Both GitCode and GitHub support **+ Add Issues**. In GitCode, choose the repository board first; in GitHub, the picker uses your default repository. Browse open/closed/all issues, filter by title, or paste an issue URL, `owner/repo#42`, or a bare number. GitCode string identifiers such as `IABC9` are supported. Click a result to pin or unpin it. Use a group’s **+ Issue** button to pin directly into that group.
+
+Issue pins have separate identities from PR pins, so an issue and PR with the same number can coexist. Issues refresh on the configured interval (closed issues use the slower closed-item interval). The board has **Issues**, **Open issues** and **Closed issues** filters. Details show the status, author, assignees, labels, description and the first 30 comments, with **Copy issue link** and **Open on GitCode/GitHub** buttons. Description and comments are displayed as plain text. PR-only actions and shortcuts do not apply to issues.
+
+Only issues you pin are tracked and refreshed. Unpin an issue to stop tracking it. Issue pins survive reloads and are included in board backups. Keep the page open for automatic refresh.
+
+The adapter uses the documented [GitCode Issue API](https://docs.gitcode.com/en/docs/apis/get-api-v-5-repos-owner-repo-issues-number/) and [GitHub Issues API](https://docs.github.com/en/rest/issues/issues); GitHub pull requests returned by the Issues API are excluded. This integration monitors issues read-only: editing, closing, and commenting remain on the hosting platform.
 
 ## The board
 
@@ -98,6 +108,6 @@ The included workflow publishes the folder to GitHub Pages on every push to `mai
 
 Runs the checks every pull request has to pass. It needs [Bun](https://bun.sh) and installs everything else itself.
 
-If Bun is unavailable, install the test dependencies with `cd tests && npm install --ignore-scripts --no-package-lock`, run `npx playwright install chromium`, then `node state-compat.mjs --head ..` and `node gitcode.mjs --head ..`. The GitCode browser tests mock all API requests; they never modify a real repository.
+If Bun is unavailable, install the test dependencies with `cd tests && npm install --ignore-scripts --no-package-lock`, run `npx playwright install chromium`, then `node state-compat.mjs --head ..`, `node gitcode.mjs --head ..` and `node issues.mjs --head ..`. The GitCode browser tests mock all API requests; they never modify a real repository.
 
 To reuse an installed browser, set `PINGBOARD_BROWSER` to its executable path when running the Node test commands. Tests launch a separate temporary profile.

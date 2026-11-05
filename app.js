@@ -146,7 +146,8 @@ function ago(value) {
   return `${Math.floor(seconds / 86400)}d`;
 }
 
-function pinKey(repo, number) {
+function pinKey(repo, number, kind = "pr") {
+  if (kind === "issue") return issuePinKey(repo, number);
   return `${repo}#${number}`;
 }
 
@@ -161,6 +162,28 @@ function safeUrl(url) {
 
 function openUrl(url) {
   if (safeUrl(url)) window.open(url, "_blank", "noopener");
+}
+
+async function copyItemLink(pr) {
+  const url = safeUrl(pr?.url);
+  const label = pr?.kind === "issue" ? "Issue" : "PR";
+  if (!url) return toast(`${label} link is unavailable`, "error");
+  try {
+    await navigator.clipboard.writeText(url);
+    toast(`${label} link copied`, "ok");
+  } catch {
+    // Clipboard access may be unavailable on HTTP or denied by the browser.
+    // Keep the exact link selected so manual copying is still one keystroke.
+    const input = el("input", { type: "text", readonly: true, value: url, "aria-label": `${label} link` });
+    mountModal({}, el("div", { class: "modal small" }, [
+      el("h2", { text: `Copy ${label} link` }),
+      el("p", { class: "muted", text: "Automatic copying is unavailable. Press Ctrl+C or ⌘C to copy the selected link." }),
+      input,
+      el("button", { class: "btn", text: "Done", onclick: closeModal })
+    ]));
+    input.focus();
+    input.select();
+  }
 }
 
 /* "123", "#123", "owner/repo#123" or a PR URL; several may be pasted at once.
@@ -255,14 +278,15 @@ function cleanBoard(raw) {
   const seen = new Set();
   const pins = [];
   for (const pin of raw.pins) {
-    if (!pin || !/^[\w.-]+\/[\w.-]+$/.test(pin.repo || "") || !Number.isInteger(pin.number) || pin.number <= 0) continue;
-    const key = pinKey(pin.repo, pin.number);
+    if (!pin || !/^[\w.-]+\/[\w.-]+$/.test(pin.repo || "") || !(pin.kind === "issue" ? validIssueNumber(pin.number) : Number.isInteger(pin.number) && pin.number > 0)) continue;
+    const key = pinKey(pin.repo, pin.number, pin.kind);
     if (seen.has(key)) continue;
     seen.add(key);
     pins.push({
       key,
       repo: pin.repo,
-      number: pin.number,
+      number: pin.kind === "issue" ? String(pin.number) : pin.number,
+      ...(pin.kind === "issue" ? { kind: "issue" } : {}),
       group: groups.some((group) => group.id === pin.group) ? pin.group : groups[0].id,
       addedAt: Number(pin.addedAt) || Date.now(),
       ...(typeof pin.seen === "string" ? { seen: pin.seen } : {})
@@ -362,7 +386,7 @@ async function importBoard(file) {
         label: "Add to my board",
         run: () => {
           const groupIds = new Map(board.groups.map((group) => [group.id, ensureGroup(group.name, group.repo).id]));
-          const added = board.pins.filter((pin) => addPin(pin.repo, pin.number, groupIds.get(pin.group))).length;
+          const added = board.pins.filter((pin) => addPin(pin.repo, pin.number, groupIds.get(pin.group), pin.kind)).length;
           applyPrefs();
           toast(`Added ${added} of ${count}`, "ok");
           render();
@@ -837,6 +861,7 @@ function summarizeCi(checks, profile) {
 }
 
 async function fetchPR(pin, { force = false } = {}) {
+  if (pin.kind === "issue") return fetchIssue(pin);
   if (IS_GITCODE) return fetchGitCodePR(pin);
   const prev = state.data.get(pin.key);
   const [owner, name] = pin.repo.split("/");
@@ -907,6 +932,7 @@ async function fetchPR(pin, { force = false } = {}) {
 
 /* What the user has "seen" for a PR; a different signature lights the change dot. */
 function signature(pr) {
+  if (pr.kind === "issue") return JSON.stringify([pr.state, pr.issueStatus, pr.updatedAt, pr.commentCount, pr.labels, pr.assignees, pr.comments]);
   return [pr.state, pr.headOid, pr.ci.state, pr.ci.fail, pr.reviewDecision, ...(IS_GITCODE ? [JSON.stringify(pr.gitcodeGate)] : [])].join("|");
 }
 
@@ -1080,7 +1106,7 @@ function refreshBaselines() {
   const now = Date.now();
   for (const pr of state.data.values()) {
     const key = `${pr.repo}@${pr.base}`;
-    if (pr.state !== "OPEN" || baselineInFlight.has(key)) continue;
+    if (pr.kind === "issue" || pr.state !== "OPEN" || baselineInFlight.has(key)) continue;
     if (now - (state.baselines.get(key)?.at || 0) <= BASELINE_TTL_MS) continue;
     baselineInFlight.add(key);
     refreshBaseline(pr.repo, pr.base).catch(() => {}).finally(() => {
@@ -1181,8 +1207,9 @@ function targetGroupId() {
   return cursorPin()?.group || boardGroups()[0]?.id;
 }
 
-function addPin(repo, number, group = targetGroupId()) {
-  const key = pinKey(repo, number);
+function addPin(repo, number, group = targetGroupId(), kind = "pr") {
+  const key = pinKey(repo, number, kind);
+  if (kind === "issue" && !validIssueNumber(number)) return false;
   if (pinByKey(key)) return false;
   if (IS_GITCODE && state.prefs.ignoredPRs?.includes(key)) {
     state.prefs.ignoredPRs = state.prefs.ignoredPRs.filter((item) => item !== key);
@@ -1192,7 +1219,7 @@ function addPin(repo, number, group = targetGroupId()) {
     ensureRepoBoard(repo);
     group = boardGroups(repo)[0].id;
   }
-  const pin = { key, repo, number, group, addedAt: Date.now() };
+  const pin = { key, repo, number, ...(kind === "issue" ? { kind } : {}), group, addedAt: Date.now() };
   state.board.pins.push(pin);
   // Ask the browser not to evict this site's storage under disk pressure.
   navigator.storage?.persist?.().catch(() => {});
@@ -1207,7 +1234,7 @@ function addPin(repo, number, group = targetGroupId()) {
 function removePin(key) {
   const pin = pinByKey(key);
   if (!pin) return;
-  if (IS_GITCODE && state.prefs.monitoredRepos.includes(pin.repo)) {
+  if (pin.kind !== "issue" && IS_GITCODE && state.prefs.monitoredRepos.includes(pin.repo)) {
     state.prefs.ignoredPRs = [...new Set([...state.prefs.ignoredPRs, key])];
     persistPrefs();
   }
@@ -1360,6 +1387,18 @@ const FILTERS = IS_GITCODE ? [
   { id: "closed", label: "Closed", test: (pr) => Boolean(pr) && pr.state !== "OPEN" }
 ];
 
+// PR-only filters must not classify an issue as missing CI or awaiting review.
+for (const filter of FILTERS) {
+  if (["all", "closed"].includes(filter.id)) continue;
+  const test = filter.test;
+  filter.test = (item) => item?.kind !== "issue" && test(item);
+}
+FILTERS.push(
+  { id: "issues", label: "Issues", test: (item) => item?.kind === "issue" },
+  { id: "issues-open", label: "Open issues", test: (item) => item?.kind === "issue" && item.state === "OPEN" },
+  { id: "issues-closed", label: "Closed issues", test: (item) => item?.kind === "issue" && item.state === "CLOSED" }
+);
+
 /* The selected PR stays listed even if a refresh moves it out of the filter, so
    actions never silently retarget to another row. */
 function matchesView(pin) {
@@ -1482,6 +1521,7 @@ function closedNotice(pr) {
 }
 
 function ciCommand(kind, pr = cursorPR()) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (!pr || pr.state !== "OPEN") return closedNotice(pr);
   const commands = profileFor(pr.repo).ciCommands;
   const command = commands?.[kind];
@@ -1501,6 +1541,7 @@ function ciCommand(kind, pr = cursorPR()) {
 /* Merge the base branch into the PR head; optionally post a command once the
    new head commit is visible (CI commands apply to the latest commit). */
 function updateBranch(pr = cursorPR(), thenComment = null) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (!pr || pr.state !== "OPEN") return closedNotice(pr);
   if (!pr.canUpdate) return toast(`You cannot update ${shortRef(pr.repo, pr.number)} — the author has not allowed maintainer edits`, "error");
   if (pr.behind === 0) return toast(`${shortRef(pr.repo, pr.number)} is already up to date with ${pr.base}`);
@@ -1524,6 +1565,7 @@ function updateBranch(pr = cursorPR(), thenComment = null) {
 }
 
 async function toggleLabel(pr, name) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (IS_GITCODE) return openUrl(pr?.url);
   if (!pr || pr.state !== "OPEN") return closedNotice(pr);
   const had = pr.labels.some((label) => label.name === name);
@@ -1545,11 +1587,13 @@ async function toggleLabel(pr, name) {
 }
 
 function quickLabel(index, pr = cursorPR()) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   const name = pr && profileFor(pr.repo).quickLabels[index];
   if (name) toggleLabel(pr, name);
 }
 
 function approve(pr = cursorPR()) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (!pr || pr.state !== "OPEN") return closedNotice(pr);
   const ref = shortRef(pr.repo, pr.number);
   openChoice({
@@ -1568,6 +1612,7 @@ function approve(pr = cursorPR()) {
 }
 
 function mergeMenu(pr = cursorPR()) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (!pr || pr.state !== "OPEN") return closedNotice(pr);
   const ref = shortRef(pr.repo, pr.number);
   const method = profileFor(pr.repo).mergeMethod;
@@ -1607,6 +1652,7 @@ function mergeMenu(pr = cursorPR()) {
 }
 
 function openBuild(pr = cursorPR()) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (!pr) return;
   const pipeline = profileFor(pr.repo).mainPipeline;
   const build = (pipeline && pr.ci.builds.find((item) => item.pipeline === pipeline)) || pr.ci.builds[0] || pr.ci.failed[0] || pr.ci.running[0];
@@ -1705,11 +1751,11 @@ function buildShell() {
         id: "filter",
         class: "filter",
         type: "search",
-        placeholder: "Filter pinned PRs",
+        placeholder: "Filter PRs and issues",
         value: state.query,
         spellcheck: "false",
         autocomplete: "off",
-        "aria-label": "Filter pinned pull requests",
+        "aria-label": "Filter pinned PRs and issues",
         oninput: (event) => {
           state.query = event.target.value;
           reselect();
@@ -1729,6 +1775,7 @@ function buildShell() {
         el("span", { class: "sync", id: "sync" }),
         IS_GITCODE ? el("button", { class: "btn", id: "monitor-repo", onclick: openRepoMonitors }) : null,
         el("button", { class: "btn primary", onclick: () => openAdd(), text: "+ Add PRs" }),
+        el("button", { class: "btn", onclick: () => openIssues(), text: "+ Add Issues" }),
         el("button", { class: "btn", title: "Refresh everything now", onclick: refreshAll, text: "Refresh" }),
         el("button", { class: "btn", id: "me", title: "Settings", onclick: openSettings })
       ])
@@ -1813,6 +1860,7 @@ function renderTop() {
     const failed = scans.filter((scan) => scan?.error).length;
     if (count) parts.push(failed ? `${failed} repository scan${failed === 1 ? "" : "s"} failed — see Add Repo` : scans.some((scan) => scan?.loading) ? "scanning repositories…" : `monitoring ${count} ${count === 1 ? "repository" : "repositories"}`);
   }
+
   const sync = document.querySelector("#sync");
   sync.className = `sync${busy ? " busy" : ""}${throttled ? " warn" : ""}`;
   sync.textContent = parts.filter(Boolean).join(" · ");
@@ -1821,6 +1869,7 @@ function renderTop() {
 
 /* The one-line answer to "what is going on with this PR, and what comes next?" */
 function verdict(pr, index) {
+  if (pr.kind === "issue") return { tone: pr.state === "CLOSED" ? "done" : "neutral", text: `Issue · ${pr.issueStatus}` };
   if (pr.state === "MERGED") return { tone: "done", text: "Merged" };
   if (pr.state === "CLOSED") return { tone: "done", text: "Closed" };
 
@@ -1921,8 +1970,9 @@ function renderBoard(index) {
   if (!boardPins().length && boardGroups().length <= 1) {
     board.replaceChildren(el("div", { class: "empty" }, [
       el("h2", { text: "Nothing pinned yet" }),
-      el("p", { text: "Pin the pull requests you are shepherding. Pingboard keeps their CI, branch freshness and review state in one view, and tells you what each one needs next." }),
-      el("button", { class: "btn primary big", onclick: () => openAdd(), text: "+ Add pull requests" })
+      el("p", { text: "Pin PRs and issues you are tracking. Pingboard keeps their status and latest updates in one view." }),
+      el("button", { class: "btn primary big", onclick: () => openAdd(), text: "+ Add pull requests" }),
+      el("button", { class: "btn big", onclick: () => openIssues(), text: "+ Add Issues" })
     ]));
     return;
   }
@@ -1957,7 +2007,8 @@ function renderBoard(index) {
         el("span", { class: "group-count", text: String(pins.length) }),
         groupSummary(pins, index),
         el("span", { class: "spacer" }),
-        el("button", { class: "link-btn", onclick: () => openAdd(group.id), text: "+ Add" }),
+        el("button", { class: "link-btn", onclick: () => openAdd(group.id), text: "+ PR" }),
+        el("button", { class: "link-btn", onclick: () => openIssues(group.id), text: "+ Issue" }),
         el("button", { class: "link-btn", onclick: () => renameGroup(group), text: "Rename" }),
         el("button", { class: "link-btn", onclick: () => deleteGroup(group), text: "Delete" })
       ]),
@@ -1966,7 +2017,7 @@ function renderBoard(index) {
         : el("div", { class: "group-empty", text: filtering ? "Nothing here matches." : "Empty — drag a pull request here, or use + Add." }))
     ]));
   }
-  if (!sections.length) sections.push(el("div", { class: "empty" }, [el("p", { text: "No pinned pull requests match this filter." })]));
+  if (!sections.length) sections.push(el("div", { class: "empty" }, [el("p", { text: "No pinned PRs or issues match this filter." })]));
   else if (!filtering) sections.push(el("button", { class: "link-btn new-group", onclick: newGroup, text: "+ New group" }));
   board.replaceChildren(...sections);
 }
@@ -2066,6 +2117,7 @@ function row(pin, index) {
 
 /* Bar + counts in words; shared by the board rows and the detail pane. */
 function ciLine(pr) {
+  if (pr.kind === "issue") return el("div", { class: "ci-line" });
   if (pr.state !== "OPEN") return el("div", { class: "ci-line" });
   const ci = pr.ci;
   const total = ci.pass + ci.fail + ci.pending;
@@ -2085,6 +2137,7 @@ function ciLine(pr) {
 }
 
 function stateBadge(pr) {
+  if (pr.kind === "issue") return el("span", { class: "badge", text: "issue" });
   if (pr.state === "MERGED") return el("span", { class: "badge merged", text: "merged" });
   if (pr.state === "CLOSED") return el("span", { class: "badge closed", text: "closed" });
   if (pr.isDraft) return el("span", { class: "badge draft", text: "draft" });
@@ -2105,7 +2158,7 @@ function renderDetail(index) {
   const detail = document.querySelector("#detail");
   const pin = cursorPin();
   const pr = cursorPR();
-  if (!pin) return detail.replaceChildren(el("div", { class: "detail-empty", text: "Select a pull request to see its CI, failures and actions." }));
+  if (!pin) return detail.replaceChildren(el("div", { class: "detail-empty", text: "Select a PR or issue to see details." }));
   if (!pr) {
     const status = state.status.get(pin.key) || {};
     return detail.replaceChildren(el("div", { class: "detail-empty" }, [
@@ -2114,6 +2167,8 @@ function renderDetail(index) {
       el("button", { class: "btn", onclick: () => removePin(pin.key), text: "Unpin" })
     ]));
   }
+
+  if (pr.kind === "issue") return renderIssueDetail(detail, pr, pin);
 
   const open = pr.state === "OPEN";
   const profile = profileFor(pr.repo);
@@ -2130,6 +2185,7 @@ function renderDetail(index) {
   blocks.push(el("div", { class: "detail-head" }, [
     el("div", { class: "btn-row detail-tools" }, [
       btn(`Open on ${PROVIDER_NAME} ↗`, () => openUrl(pr.url)),
+      btn("Copy PR link", () => copyItemLink(pr), { title: "Copy the PR URL to share with an agent" }),
       btn("Move to group…", () => openGroupPicker(pin)),
       btn("Refresh", () => queueRefresh(pin, { force: true })),
       btn("Unpin", () => removePin(pr.key))
@@ -2660,6 +2716,7 @@ function openAdd(groupId = targetGroupId()) {
 }
 
 function openLabels(pr = cursorPR()) {
+  if (pr?.kind === "issue") return toast("This action applies to pull requests only");
   if (IS_GITCODE) return openUrl(pr?.url);
   if (!pr || pr.state !== "OPEN") return;
   let all = state.labels.get(pr.repo)?.items || [];
