@@ -1831,10 +1831,16 @@ function renderTop() {
   if (IS_GITCODE) {
     const select = document.querySelector("#board-repo");
     const repos = repositoryNames();
-    select.disabled = !repos.length;
-    select.replaceChildren(...(repos.length
-      ? repos.map((repo) => el("option", { value: repo, selected: repo === state.prefs.activeRepo, text: repo }))
-      : [el("option", { value: "", text: "No repositories", disabled: true })]));
+    const values = repos.length ? repos : [""];
+    // Rebuilding options during background refresh disrupts the native open menu.
+    if (select.options.length !== values.length || values.some((value, i) => select.options[i].value !== value)) {
+      select.replaceChildren(...(repos.length
+        ? repos.map((repo) => el("option", { value: repo, text: repo }))
+        : [el("option", { value: "", text: "No repositories", disabled: true })]));
+    }
+    if (select.disabled !== !repos.length) select.disabled = !repos.length;
+    const selected = state.prefs.activeRepo || "";
+    if (select.value !== selected) select.value = selected;
   }
   const counts = Object.fromEntries(FILTERS.map((filter) => [filter.id, 0]));
   for (const pin of boardPins()) {

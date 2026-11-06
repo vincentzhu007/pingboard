@@ -188,6 +188,24 @@ try {
   await page.reload();
   await page.waitForFunction(() => state.user && state.prefs.monitoredRepos.length === 1);
   assert.deepEqual(await page.evaluate(() => state.prefs.monitoredRepos), ["example-org/second"]);
+  await page.locator("#board-repo option").first().waitFor({ state: "attached" });
+  // Background rendering must not rebuild an open native repository menu.
+  const stableRepositoryMenu = await page.evaluate(async () => {
+    const select = document.querySelector("#board-repo");
+    select.focus();
+    const options = [...select.options];
+    let mutations = 0;
+    const observer = new MutationObserver((records) => { mutations += records.length; });
+    observer.observe(select, { childList: true, subtree: true, attributes: true });
+    for (let i = 0; i < 3; i += 1) {
+      render();
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
+    observer.disconnect();
+    return options.every((option, i) => select.options[i] === option) && mutations === 0;
+  });
+  assert.equal(stableRepositoryMenu, true, "Background refresh must preserve repository menu options without mutations");
+
   // Each repository can browse and toggle its own pins, including the same PR number.
   await page.getByRole("combobox", { name: "Repository board" }).selectOption("example-org/second");
   await page.getByRole("button", { name: "+ Add PRs", exact: true }).click();
